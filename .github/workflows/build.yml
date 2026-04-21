@@ -1,0 +1,98 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Download FFmpeg
+      run: |
+        $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        Invoke-WebRequest -Uri $ffmpegUrl -OutFile "ffmpeg.zip"
+        Expand-Archive -Path "ffmpeg.zip" -DestinationPath "."
+        $ffmpegDir = Get-ChildItem -Directory -Name "ffmpeg-*"
+        Copy-Item "$ffmpegDir/bin/ffmpeg.exe" .
+        Copy-Item "$ffmpegDir/bin/ffprobe.exe" .
+        Remove-Item -Recurse -Force "$ffmpegDir"
+        Remove-Item "ffmpeg.zip"
+
+    - name: Build executable
+      run: |
+        pyinstaller VideoClipper.spec
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: VideoClipper
+        path: dist/VideoClipper.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: VideoClipper
+        path: ./dist
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        body: |
+          ## 下载 | Download
+
+          - Windows 可执行文件 | Windows Executable: `VideoClipper.exe`
+
+          ## 使用说明 | Usage
+
+          1. 下载 `VideoClipper.exe`
+          2. 双击运行（可选：将 FFmpeg 放在同目录）
+          3. 拖入视频，设置参数，导出
+
+          ## 更新日志 | Changelog
+
+          详见提交历史 | See commit history for details.
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/VideoClipper.exe
+        asset_name: VideoClipper.exe
+        asset_content_type: application/x-msdownload
