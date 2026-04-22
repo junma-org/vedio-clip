@@ -28,14 +28,25 @@ if errorlevel 1 goto :error
 
 echo.
 echo [1/5] Checking bundled FFmpeg files...
+set "NEED_FFMPEG="
+if not exist "ffmpeg.exe" set "NEED_FFMPEG=1"
+if not exist "ffprobe.exe" set "NEED_FFMPEG=1"
+
+if defined NEED_FFMPEG (
+    echo ffmpeg.exe or ffprobe.exe is missing. Downloading automatically...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\download_ffmpeg.ps1" -Destination "%CD%"
+    if errorlevel 1 (
+        echo ERROR: Failed to download FFmpeg.
+        goto :error
+    )
+)
+
 if not exist "ffmpeg.exe" (
-    echo ERROR: ffmpeg.exe is missing in this folder.
-    echo Put ffmpeg.exe next to build_spec.bat, then run again.
+    echo ERROR: ffmpeg.exe is still missing after download.
     goto :error
 )
 if not exist "ffprobe.exe" (
-    echo ERROR: ffprobe.exe is missing in this folder.
-    echo Put ffprobe.exe next to build_spec.bat, then run again.
+    echo ERROR: ffprobe.exe is still missing after download.
     goto :error
 )
 echo OK: ffmpeg.exe and ffprobe.exe will be bundled into the final EXE.

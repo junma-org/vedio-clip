@@ -31,14 +31,7 @@ jobs:
 
     - name: Download FFmpeg
       run: |
-        $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-        Invoke-WebRequest -Uri $ffmpegUrl -OutFile "ffmpeg.zip"
-        Expand-Archive -Path "ffmpeg.zip" -DestinationPath "."
-        $ffmpegDir = Get-ChildItem -Directory -Name "ffmpeg-*"
-        Copy-Item "$ffmpegDir/bin/ffmpeg.exe" .
-        Copy-Item "$ffmpegDir/bin/ffprobe.exe" .
-        Remove-Item -Recurse -Force "$ffmpegDir"
-        Remove-Item "ffmpeg.zip"
+        powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\download_ffmpeg.ps1" -Destination "."
 
     - name: Build executable
       run: |
@@ -80,7 +73,7 @@ jobs:
           ## 使用说明 | Usage
 
           1. 下载 `VideoClipper.exe`
-          2. 双击运行（可选：将 FFmpeg 放在同目录）
+          2. 双击运行
           3. 拖入视频，设置参数，导出
 
           ## 更新日志 | Changelog

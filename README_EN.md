@@ -11,6 +11,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **Drag & Drop**: Simply drag and drop video files into the window
 - **Trim Start**: Specify seconds to trim from the beginning (default 30s)
 - **Resolution Options**: Support for multiple common resolutions
+- **Video Preview**: Show the first frame after selecting a file
+- **Open Output Folder**: Automatically open the output folder after processing
 - **Real-time Progress**: Display processing progress and status
 - **Single Executable**: Standalone exe file after packaging
 
@@ -20,7 +22,7 @@ A simple and user-friendly video clipping tool for Windows beginners.
 
 - Windows 7/10/11
 - No Python installation required (for packaged version)
-- FFmpeg required (the app will guide you on how to obtain it)
+- FFmpeg is bundled in packaged releases
 
 ---
 
@@ -29,8 +31,7 @@ A simple and user-friendly video clipping tool for Windows beginners.
 ### Option 1: Use Packaged Version (Recommended)
 
 1. Download `VideoClipper.exe` from the [Releases](../../releases) page
-2. (Optional) Place `ffmpeg.exe` and `ffprobe.exe` in the same directory
-3. Double-click to run
+2. Double-click to run
 
 ### Option 2: Run from Source
 
@@ -54,26 +55,23 @@ Developers can package it as a standalone exe:
 
 ```bash
 # Run build script
-build.bat
+build_spec.bat
 ```
 
-Or manually package:
+Or manually package after placing `ffmpeg.exe` and `ffprobe.exe` in the project folder:
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "VideoClipper" main.py
+pip install -r requirements.txt
+pyinstaller VideoClipper.spec --clean --noconfirm
 ```
 
 ---
 
 ## FFmpeg Download
 
-If the app reports FFmpeg not found:
+The build script and GitHub Actions automatically download the FFmpeg essentials build and bundle `ffmpeg.exe` and `ffprobe.exe` into the final EXE.
 
-1. Visit https://ffmpeg.org/download.html
-2. Download Windows builds (essentials version)
-3. Extract and locate `ffmpeg.exe` and `ffprobe.exe`
-4. Place them in the same directory as the app, or add to system PATH
+If running from source, place `ffmpeg.exe` and `ffprobe.exe` in the project folder, or add them to system PATH.
 
 ---
 
@@ -93,7 +91,8 @@ video-clipper/
 ├── gui.py           # PySide6 GUI
 ├── ffmpeg_utils.py  # FFmpeg utilities
 ├── requirements.txt # Python dependencies
-├── build.bat        # One-click build script
+├── build_spec.bat   # One-click build script
+├── scripts/         # Build helper scripts
 ├── README.md        # Chinese documentation
 ├── README_EN.md     # English documentation
 └── .github/

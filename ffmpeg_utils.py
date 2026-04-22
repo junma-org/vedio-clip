@@ -291,6 +291,50 @@ def get_video_info(ffmpeg_path, video_path):
     return _fallback_video_info_from_ffmpeg(ffmpeg_path, video_path)
 
 
+def build_thumbnail_command(ffmpeg_path, video_path, output_path):
+    """构建从视频第一帧提取预览图的 FFmpeg 命令。"""
+    return [
+        str(ffmpeg_path),
+        '-y',
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-i', str(video_path),
+        '-map', '0:v:0',
+        '-frames:v', '1',
+        '-vf', 'scale=640:-2',
+        '-q:v', '3',
+        str(output_path),
+    ]
+
+
+def extract_video_thumbnail(ffmpeg_path, video_path, output_path):
+    """
+    从视频第一帧提取预览图。
+
+    Args:
+        ffmpeg_path: FFmpeg路径
+        video_path: 视频文件路径
+        output_path: 预览图输出路径
+
+    Returns:
+        bool: 成功返回 True，失败返回 False
+    """
+    try:
+        cmd = build_thumbnail_command(ffmpeg_path, video_path, output_path)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            creationflags=_creationflags(),
+        )
+        return result.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0
+    except Exception as e:
+        print(f"提取视频预览图失败: {e}")
+        return False
+
+
 def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0, 
                          resolution=None, video_bitrate=None, audio_bitrate='128k'):
     """
