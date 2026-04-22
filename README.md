@@ -160,4 +160,4 @@ Issues and Pull Requests are welcome!
 
 ## 截图 | Screenshots
 
-![主界面](./docs/screenshot_main.png)
+![主界面](./docs/screenshot_1.png)

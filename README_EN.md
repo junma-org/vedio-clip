@@ -125,4 +125,4 @@ Issues and Pull Requests are welcome!
 
 ## Screenshots
 
-![Main Interface](./docs/screenshot_main.png)
+![Main Interface](./docs/screenshot_1.png)
