@@ -3,10 +3,16 @@ FFmpeg工具模块
 负责FFmpeg路径检测和命令执行
 """
 import json
+import os
 import sys
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
+
+from edit_model import DeleteRange, EditPlan, OutputOptions
+from edit_model import normalize_delete_ranges as normalize_plan_delete_ranges
+from subtitle_model import write_srt_file
 
 
 def _runtime_search_dirs():
@@ -191,6 +197,7 @@ def _fallback_video_info_from_ffmpeg(ffmpeg_path, video_path):
         'height': 0,
         'fps': 0,
         'bitrate': 0,
+        'has_audio': True,
     }
 
     try:
@@ -202,6 +209,7 @@ def _fallback_video_info_from_ffmpeg(ffmpeg_path, video_path):
             creationflags=_creationflags(),
         )
         info['duration'] = _parse_ffmpeg_duration(result.stderr)
+        info['has_audio'] = 'Audio:' in result.stderr
     except Exception as e:
         print(f"使用FFmpeg兜底获取视频信息失败: {e}")
 
@@ -224,7 +232,8 @@ def get_video_info(ffmpeg_path, video_path):
         'width': 0,
         'height': 0,
         'fps': 0,
-        'bitrate': 0
+        'bitrate': 0,
+        'has_audio': True,
     }
     
     try:
@@ -234,8 +243,7 @@ def get_video_info(ffmpeg_path, video_path):
             cmd = [
                 str(ffprobe_path),
                 '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'format=duration,bit_rate:stream=width,height,r_frame_rate',
+                '-show_entries', 'format=duration,bit_rate:stream=codec_type,width,height,r_frame_rate',
                 '-of', 'json',
                 str(video_path)
             ]
@@ -254,8 +262,10 @@ def get_video_info(ffmpeg_path, video_path):
                 format_info = payload.get('format', {}) or {}
                 stream_info = {}
                 streams = payload.get('streams', []) or []
-                if streams:
-                    stream_info = streams[0] or {}
+                video_streams = [stream for stream in streams if stream.get('codec_type') == 'video']
+                info['has_audio'] = any(stream.get('codec_type') == 'audio' for stream in streams)
+                if video_streams:
+                    stream_info = video_streams[0] or {}
 
                 duration = format_info.get('duration')
                 if duration not in (None, '', 'N/A'):
@@ -307,6 +317,102 @@ def build_thumbnail_command(ffmpeg_path, video_path, output_path):
     ]
 
 
+def normalize_delete_ranges(ranges, total_duration=None):
+    """兼容导出：裁剪、排序并合并删除区间。"""
+    return normalize_plan_delete_ranges(ranges, total_duration=total_duration)
+
+
+def _normalize_ranges(ranges, total_duration=None):
+    """兼容内部旧调用，统一委托给公开的删除区间归一化函数。"""
+    return normalize_delete_ranges(ranges, total_duration)
+
+
+def calculate_output_duration(total_duration, skip_seconds=0, delete_ranges=None):
+    """根据跳过开头和删除区间估算输出时长。"""
+    plan = EditPlan(
+        skip_seconds=skip_seconds,
+        delete_ranges=tuple(DeleteRange(start, end) for start, end in (delete_ranges or [])),
+    )
+    return plan.output_duration(total_duration)
+
+
+def _format_filter_number(value):
+    """把秒数格式化成 FFmpeg 表达式中稳定的数字字符串。"""
+    text = f"{float(value):.3f}".rstrip('0').rstrip('.')
+    return text if text else '0'
+
+
+def _build_keep_expression(skip_seconds=0, delete_ranges=None):
+    """构建 FFmpeg select/aselect 使用的保留表达式。"""
+    conditions = []
+    if skip_seconds > 0:
+        conditions.append(f"gte(t,{_format_filter_number(skip_seconds)})")
+
+    for start, end in _normalize_ranges(delete_ranges):
+        conditions.append(
+            f"not(between(t,{_format_filter_number(start)},{_format_filter_number(end)}))"
+        )
+
+    if not conditions:
+        return None
+
+    return '*'.join(conditions)
+
+
+def _build_keep_expression_from_plan(edit_plan, include_skip_without_delete=False):
+    """根据规范化后的编辑计划构建 FFmpeg select/aselect 保留表达式。"""
+    plan = edit_plan.normalized()
+    return _build_keep_expression(
+        skip_seconds=plan.skip_seconds if plan.delete_ranges or include_skip_without_delete else 0,
+        delete_ranges=plan.delete_range_tuples(),
+    )
+
+
+def _escape_filter_value(value):
+    """转义 FFmpeg filter 参数中的路径或样式值。"""
+    text = str(value).replace("\\", "/")
+    return (
+        text.replace("'", "\\'")
+        .replace(":", "\\:")
+        .replace(",", "\\,")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
+
+def _build_subtitle_force_style(style):
+    style = style.normalized()
+    return (
+        f"FontSize={style.font_size},"
+        f"MarginV={style.bottom_margin},"
+        "Outline=2,"
+        "Shadow=0,"
+        "Alignment=2"
+    )
+
+
+def _build_subtitles_filter(subtitle_path, style):
+    escaped_path = _escape_filter_value(Path(subtitle_path).resolve())
+    force_style = _build_subtitle_force_style(style)
+    return f"subtitles=filename='{escaped_path}':force_style='{force_style}'"
+
+
+def prepare_subtitle_file_for_plan(edit_plan):
+    """把 EditPlan 内的字幕写到临时 SRT 文件，返回文件路径；无字幕则返回 None。"""
+    track = edit_plan.normalized().subtitles
+    if not track.has_entries():
+        return None
+
+    fd, subtitle_path = tempfile.mkstemp(prefix="videoclipper_subtitles_", suffix=".srt")
+    os.close(fd)
+    try:
+        write_srt_file(track.entries, subtitle_path)
+        return subtitle_path
+    except Exception:
+        Path(subtitle_path).unlink(missing_ok=True)
+        raise
+
+
 def extract_video_thumbnail(ffmpeg_path, video_path, output_path):
     """
     从视频第一帧提取预览图。
@@ -335,48 +441,85 @@ def extract_video_thumbnail(ffmpeg_path, video_path, output_path):
         return False
 
 
-def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0, 
-                         resolution=None, video_bitrate=None, audio_bitrate='128k'):
+def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_plan, subtitle_path=None):
     """
-    构建FFmpeg剪辑命令
-    
+    根据统一编辑模型构建 FFmpeg 剪辑命令。
+
     Args:
         ffmpeg_path: FFmpeg路径
         input_path: 输入视频路径
         output_path: 输出视频路径
-        skip_seconds: 跳过的开头秒数
-        resolution: 目标分辨率元组 (宽, 高)，None表示保持原分辨率
-        video_bitrate: 视频比特率，None表示自动
-        audio_bitrate: 音频比特率
-        
+        edit_plan: EditPlan 编辑计划
+
     Returns:
         list: FFmpeg命令参数列表
     """
+    plan = edit_plan.normalized()
     cmd = [ffmpeg_path, '-y', '-i', str(input_path)]
-    
-    # 跳过开头
-    if skip_seconds > 0:
-        cmd.extend(['-ss', str(skip_seconds)])
-    
+
+    has_subtitles = bool(subtitle_path and plan.subtitles.has_entries())
+    keep_expression = _build_keep_expression_from_plan(
+        plan,
+        include_skip_without_delete=has_subtitles,
+    )
+
+    # 没有中间删除和字幕时沿用 -ss，避免改变既有极简剪开头行为。
+    if plan.skip_seconds > 0 and not plan.delete_ranges and not has_subtitles:
+        cmd.extend(['-ss', str(plan.skip_seconds)])
+
     # 视频编码器
     cmd.extend(['-c:v', 'libx264', '-preset', 'medium'])
-    
-    # 分辨率
-    if resolution:
-        width, height = resolution
-        cmd.extend(['-vf', f'scale={width}:{height}'])
-    
+
+    video_filters = []
+    if has_subtitles:
+        video_filters.append(_build_subtitles_filter(subtitle_path, plan.subtitles.style))
+
+    if keep_expression:
+        video_filters.extend([f"select='{keep_expression}'", 'setpts=N/FRAME_RATE/TB'])
+
+    if plan.output.resolution:
+        width, height = plan.output.resolution
+        video_filters.append(f'scale={width}:{height}')
+
+    if video_filters:
+        cmd.extend(['-vf', ','.join(video_filters)])
+
     # 视频比特率
-    if video_bitrate:
-        cmd.extend(['-b:v', video_bitrate])
-    
+    if plan.output.video_bitrate:
+        cmd.extend(['-b:v', plan.output.video_bitrate])
+
     # 音频
-    cmd.extend(['-c:a', 'aac', '-b:a', audio_bitrate])
+    if plan.has_audio:
+        if keep_expression:
+            cmd.extend(['-af', f"aselect='{keep_expression}',asetpts=N/SR/TB"])
+        cmd.extend(['-c:a', 'aac', '-b:a', plan.output.audio_bitrate])
+    else:
+        cmd.append('-an')
     
     # 输出
     cmd.append(str(output_path))
     
     return cmd
+
+
+def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0,
+                         resolution=None, video_bitrate=None, audio_bitrate='128k',
+                         delete_ranges=None, has_audio=True):
+    """
+    构建FFmpeg剪辑命令。
+    兼容旧调用；新代码优先使用 build_ffmpeg_command_from_plan。
+    """
+    plan = EditPlan(
+        skip_seconds=skip_seconds,
+        delete_ranges=tuple(DeleteRange(start, end) for start, end in (delete_ranges or [])),
+        output=OutputOptions(
+            resolution=resolution,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+        ),
+        has_audio=has_audio,
+    )
+    return build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, plan)
 
 
 def format_time(seconds):

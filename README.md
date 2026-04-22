@@ -12,6 +12,9 @@ A simple and user-friendly video clipping tool for Windows beginners.
 
 - **拖放操作**: 直接拖放视频文件到窗口即可
 - **剪掉开头**: 输入要剪掉的前 N 秒（默认 30 秒）
+- **删除区间**: 可添加多个指定秒数区间，例如删除 10-20 秒、80-100 秒
+- **达人模式 MVP**: 支持视频预览、定位时间点、设置入点/出点并加入删除区间
+- **字幕基础能力**: 达人模式支持手动字幕、SRT 导入和烧录导出
 - **分辨率选择**: 支持多种常用分辨率
 - **视频预览**: 选中文件后显示第一帧，方便确认内容
 - **自动打开目录**: 处理完成后自动打开导出文件所在目录
@@ -22,6 +25,9 @@ A simple and user-friendly video clipping tool for Windows beginners.
 
 - **Drag & Drop**: Simply drag and drop video files into the window
 - **Trim Start**: Specify seconds to trim from the beginning (default 30s)
+- **Delete Ranges**: Add multiple time ranges to remove, such as 10-20s and 80-100s
+- **Expert Mode MVP**: Preview video, seek to a timestamp, set in/out points, and add delete ranges
+- **Basic Subtitles**: Add manual subtitles, import SRT files, and burn subtitles into exported video
 - **Resolution Options**: Support for multiple common resolutions
 - **Video Preview**: Show the first frame after selecting a file
 - **Open Output Folder**: Automatically open the output folder after processing
@@ -120,6 +126,8 @@ If running from source, place `ffmpeg.exe` and `ffprobe.exe` in the project fold
 video-clipper/
 ├── main.py          # 主程序入口 | Main entry point
 ├── gui.py           # PySide6 界面 | PySide6 GUI
+├── edit_model.py    # 统一编辑模型 | Unified edit model
+├── subtitle_model.py # 字幕模型与 SRT 读写 | Subtitle model and SRT I/O
 ├── ffmpeg_utils.py  # FFmpeg 工具函数 | FFmpeg utilities
 ├── requirements.txt # Python 依赖 | Python dependencies
 ├── build_spec.bat   # 一键打包脚本 | One-click build script
