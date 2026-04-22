@@ -126,5 +126,3 @@ Issues and Pull Requests are welcome!
 ## Screenshots
 
 ![Main Interface](./docs/screenshot_main.png)
-
-*(Screenshots will be added in future versions)*

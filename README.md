@@ -161,5 +161,3 @@ Issues and Pull Requests are welcome!
 ## 截图 | Screenshots
 
 ![主界面](./docs/screenshot_main.png)
-
-*(截图将在后续版本添加 | Screenshots will be added in future versions)*
