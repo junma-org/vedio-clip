@@ -13,8 +13,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **拖放操作**: 直接拖放视频文件到窗口即可
 - **剪掉开头**: 输入要剪掉的前 N 秒（默认 30 秒）
 - **删除区间**: 可添加多个指定秒数区间，例如删除 10-20 秒、80-100 秒
-- **达人模式 MVP**: 支持视频预览、定位时间点、设置入点/出点并加入删除区间
-- **字幕基础能力**: 达人模式支持手动字幕、SRT 导入和烧录导出
+- **达人编辑台**: 自动最大化、视频预览、时间轴拖选、删除选区、删除当前帧
+- **ASS 字幕链路**: 支持 ASS/SRT 导入、剪贴板导入、字幕列表编辑、实时预览和硬字幕烧录
 - **分辨率选择**: 支持多种常用分辨率
 - **视频预览**: 选中文件后显示第一帧，方便确认内容
 - **自动打开目录**: 处理完成后自动打开导出文件所在目录
@@ -127,7 +127,9 @@ video-clipper/
 ├── main.py          # 主程序入口 | Main entry point
 ├── gui.py           # PySide6 界面 | PySide6 GUI
 ├── edit_model.py    # 统一编辑模型 | Unified edit model
-├── subtitle_model.py # 字幕模型与 SRT 读写 | Subtitle model and SRT I/O
+├── subtitle_model.py # 字幕工程模型与 ASS/SRT 读写 | Subtitle project model and ASS/SRT I/O
+├── timeline_state.py # 时间轴纯逻辑 | Timeline logic
+├── timeline_widget.py # 达人模式时间轴控件 | Expert timeline widget
 ├── ffmpeg_utils.py  # FFmpeg 工具函数 | FFmpeg utilities
 ├── requirements.txt # Python 依赖 | Python dependencies
 ├── build_spec.bat   # 一键打包脚本 | One-click build script
@@ -143,9 +145,10 @@ video-clipper/
 
 ## 技术栈 | Tech Stack
 
-- Python 3.8+
+- Python 3.10+
 - PySide6 (GUI 框架 | GUI framework)
 - FFmpeg (视频处理 | Video processing)
+- pysubs2 (字幕读写与 ASS/SRT 转换 | Subtitle parsing and ASS/SRT conversion)
 - PyInstaller (打包工具 | Packaging tool)
 
 ---

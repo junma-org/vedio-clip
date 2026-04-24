@@ -65,16 +65,16 @@ if errorlevel 1 (
 
 echo.
 echo [3/5] Checking build dependencies...
-%PYTHON_CMD% -c "import PyInstaller, PySide6" >nul 2>nul
+%PYTHON_CMD% -c "import PyInstaller, PySide6, pysubs2" >nul 2>nul
 if errorlevel 1 (
-    echo Missing PyInstaller or PySide6. Installing...
-    %PYTHON_CMD% -m pip install pyinstaller PySide6
+    echo Missing build dependencies. Installing from requirements.txt...
+    %PYTHON_CMD% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo ERROR: Failed to install build dependencies.
         goto :error
     )
 ) else (
-    echo OK: PyInstaller and PySide6 are already available.
+    echo OK: PyInstaller, PySide6, and pysubs2 are already available.
 )
 
 echo.

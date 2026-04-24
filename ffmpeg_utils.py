@@ -12,7 +12,10 @@ from pathlib import Path
 
 from edit_model import DeleteRange, EditPlan, OutputOptions
 from edit_model import normalize_delete_ranges as normalize_plan_delete_ranges
-from subtitle_model import write_srt_file
+from subtitle_model import export_subtitle_project_to_ass
+
+
+_PROCESS_OUTPUT_ENCODINGS = ("utf-8", "utf-8-sig", "gb18030", "gbk")
 
 
 def _runtime_search_dirs():
@@ -62,6 +65,21 @@ def _find_local_binary(binary_names):
 def _creationflags():
     """Windows下隐藏ffmpeg/ffprobe控制台窗口。"""
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+
+
+def decode_process_output(data):
+    """把子进程输出安全解码成文本，避免 Windows 默认编码导致异常。"""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+
+    for encoding in _PROCESS_OUTPUT_ENCODINGS:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def find_ffmpeg():
@@ -134,13 +152,12 @@ def check_ffmpeg_version(ffmpeg_path):
         result = subprocess.run(
             [ffmpeg_path, '-version'],
             capture_output=True,
-            text=True,
             timeout=10,
             creationflags=_creationflags(),
         )
         if result.returncode == 0:
             # 第一行通常是版本信息
-            first_line = result.stdout.strip().split('\n')[0]
+            first_line = decode_process_output(result.stdout).strip().split('\n')[0]
             return first_line
     except Exception as e:
         print(f"检查FFmpeg版本失败: {e}")
@@ -161,12 +178,11 @@ def check_ffprobe_version(ffprobe_path):
         result = subprocess.run(
             [ffprobe_path, '-version'],
             capture_output=True,
-            text=True,
             timeout=10,
             creationflags=_creationflags(),
         )
         if result.returncode == 0:
-            return result.stdout.strip().split('\n')[0]
+            return decode_process_output(result.stdout).strip().split('\n')[0]
     except Exception as e:
         print(f"检查FFprobe版本失败: {e}")
     return None
@@ -204,12 +220,12 @@ def _fallback_video_info_from_ffmpeg(ffmpeg_path, video_path):
         result = subprocess.run(
             [ffmpeg_path, '-i', str(video_path)],
             capture_output=True,
-            text=True,
             timeout=30,
             creationflags=_creationflags(),
         )
-        info['duration'] = _parse_ffmpeg_duration(result.stderr)
-        info['has_audio'] = 'Audio:' in result.stderr
+        stderr_text = decode_process_output(result.stderr)
+        info['duration'] = _parse_ffmpeg_duration(stderr_text)
+        info['has_audio'] = 'Audio:' in stderr_text
     except Exception as e:
         print(f"使用FFmpeg兜底获取视频信息失败: {e}")
 
@@ -251,13 +267,13 @@ def get_video_info(ffmpeg_path, video_path):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
                 timeout=30,
                 creationflags=_creationflags(),
             )
 
-            if result.returncode == 0 and result.stdout.strip():
-                payload = json.loads(result.stdout)
+            stdout_text = decode_process_output(result.stdout)
+            if result.returncode == 0 and stdout_text.strip():
+                payload = json.loads(stdout_text)
 
                 format_info = payload.get('format', {}) or {}
                 stream_info = {}
@@ -380,33 +396,21 @@ def _escape_filter_value(value):
     )
 
 
-def _build_subtitle_force_style(style):
-    style = style.normalized()
-    return (
-        f"FontSize={style.font_size},"
-        f"MarginV={style.bottom_margin},"
-        "Outline=2,"
-        "Shadow=0,"
-        "Alignment=2"
-    )
-
-
-def _build_subtitles_filter(subtitle_path, style):
+def _build_subtitles_filter(subtitle_path):
     escaped_path = _escape_filter_value(Path(subtitle_path).resolve())
-    force_style = _build_subtitle_force_style(style)
-    return f"subtitles=filename='{escaped_path}':force_style='{force_style}'"
+    return f"subtitles=filename='{escaped_path}'"
 
 
 def prepare_subtitle_file_for_plan(edit_plan):
-    """把 EditPlan 内的字幕写到临时 SRT 文件，返回文件路径；无字幕则返回 None。"""
+    """把 EditPlan 内的字幕写到临时 ASS 文件，返回文件路径；无字幕则返回 None。"""
     track = edit_plan.normalized().subtitles
     if not track.has_entries():
         return None
 
-    fd, subtitle_path = tempfile.mkstemp(prefix="videoclipper_subtitles_", suffix=".srt")
+    fd, subtitle_path = tempfile.mkstemp(prefix="videoclipper_subtitles_", suffix=".ass")
     os.close(fd)
     try:
-        write_srt_file(track.entries, subtitle_path)
+        export_subtitle_project_to_ass(track, subtitle_path)
         return subtitle_path
     except Exception:
         Path(subtitle_path).unlink(missing_ok=True)
@@ -431,7 +435,6 @@ def extract_video_thumbnail(ffmpeg_path, video_path, output_path):
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=30,
             creationflags=_creationflags(),
         )
@@ -439,6 +442,94 @@ def extract_video_thumbnail(ffmpeg_path, video_path, output_path):
     except Exception as e:
         print(f"提取视频预览图失败: {e}")
         return False
+
+
+def build_ffmpeg_progress_command(cmd):
+    """为 FFmpeg 命令补充机器可读进度输出。"""
+    if not cmd:
+        return []
+    return [cmd[0], '-hide_banner', '-loglevel', 'error', '-nostats', '-progress', 'pipe:1', *cmd[1:]]
+
+
+def _parse_clock_time_seconds(text):
+    try:
+        hours, minutes, seconds = str(text).strip().split(":")
+        return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_progress_time_seconds(key, value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    if key in {"out_time_ms", "out_time_us"}:
+        try:
+            return int(text) / 1_000_000
+        except ValueError:
+            return None
+
+    if ":" in text:
+        return _parse_clock_time_seconds(text)
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def run_ffmpeg_with_progress(cmd, expected_duration=None, stop_requested=None, progress_callback=None):
+    """运行 FFmpeg 并通过 `-progress pipe:1` 回调进度。"""
+    progress_cmd = build_ffmpeg_progress_command(cmd)
+    process = subprocess.Popen(
+        progress_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=_creationflags(),
+    )
+
+    cancelled = False
+    stderr_text = ""
+    try:
+        while True:
+            if stop_requested and stop_requested():
+                cancelled = True
+                if process.poll() is None:
+                    process.terminate()
+                break
+
+            line = process.stdout.readline() if process.stdout is not None else b""
+            if not line:
+                if process.poll() is not None:
+                    break
+                continue
+
+            raw_line = decode_process_output(line).strip()
+            if "=" not in raw_line:
+                continue
+
+            key, value = raw_line.split("=", 1)
+            if key not in {"out_time_ms", "out_time_us", "out_time"}:
+                continue
+
+            current_seconds = _parse_progress_time_seconds(key, value)
+            if current_seconds is None or not expected_duration or expected_duration <= 0:
+                continue
+
+            progress = min(int((current_seconds / expected_duration) * 100), 100)
+            if progress_callback:
+                progress_callback(progress)
+    finally:
+        if process.stderr is not None:
+            stderr_text = decode_process_output(process.stderr.read())
+        returncode = process.wait()
+
+    return {
+        "returncode": returncode,
+        "stderr": stderr_text.strip(),
+        "cancelled": cancelled,
+    }
 
 
 def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_plan, subtitle_path=None):
@@ -472,7 +563,7 @@ def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_pl
 
     video_filters = []
     if has_subtitles:
-        video_filters.append(_build_subtitles_filter(subtitle_path, plan.subtitles.style))
+        video_filters.append(_build_subtitles_filter(subtitle_path))
 
     if keep_expression:
         video_filters.extend([f"select='{keep_expression}'", 'setpts=N/FRAME_RATE/TB'])

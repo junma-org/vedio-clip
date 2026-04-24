@@ -7,7 +7,10 @@ from subtitle_model import (
     SubtitleValidationError,
     add_subtitle_from_marks,
     format_srt_timestamp,
+    load_ass_text,
+    load_subtitle_text,
     parse_srt_text,
+    serialize_ass_project,
     serialize_srt_entries,
 )
 
@@ -61,6 +64,58 @@ class SubtitleModelTest(unittest.TestCase):
         self.assertEqual([entry.text for entry in track.entries], ["前", "后"])
         self.assertEqual(track.style.font_size, 30)
         self.assertEqual(track.style.bottom_margin, 40)
+
+    def test_load_subtitle_text_converts_srt_into_ass_project(self):
+        project = load_subtitle_text(
+            """1
+00:00:01,000 --> 00:00:02,000
+你好
+""",
+            source_hint="clipboard",
+            video_size=(1080, 1920),
+        )
+
+        self.assertEqual(project.play_res_x, 1080)
+        self.assertEqual(project.play_res_y, 1920)
+        self.assertEqual(project.cues[0].text, "你好")
+        self.assertEqual(project.cues[0].style_name, "short_speech_bottom")
+
+    def test_load_ass_text_preserves_style_name_and_raw_tags(self):
+        project = load_ass_text(
+            """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: custom,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,20,20,24,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+Dialogue: 0,0:00:01.00,0:00:03.00,custom,,0000,0000,0000,,{\\b1}Hello\\NWorld
+"""
+        )
+
+        self.assertEqual(project.play_res_x, 1280)
+        self.assertEqual(project.cues[0].style_name, "custom")
+        self.assertEqual(project.cues[0].raw_tags, "{\\b1}")
+        self.assertEqual(project.cues[0].text, "Hello\nWorld")
+
+    def test_serialize_ass_project_writes_dialogue_and_styles(self):
+        project = SubtitleTrack(
+            entries=(SubtitleEntry(1, 2, "字幕"),),
+            style=SubtitleStyle(font_size=36, bottom_margin=64),
+            play_res_x=1080,
+            play_res_y=1920,
+        ).normalized()
+
+        content = serialize_ass_project(project)
+
+        self.assertIn("[V4+ Styles]", content)
+        self.assertIn("Style: short_speech_bottom", content)
+        self.assertIn("Dialogue: 0,0:00:01.00,0:00:02.00,short_speech_bottom", content)
+        self.assertIn("字幕", content)
 
     def test_format_srt_timestamp_rounds_milliseconds(self):
         self.assertEqual(format_srt_timestamp(3661.2345), "01:01:01,234")

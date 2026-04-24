@@ -11,8 +11,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **Drag & Drop**: Simply drag and drop video files into the window
 - **Trim Start**: Specify seconds to trim from the beginning (default 30s)
 - **Delete Ranges**: Add multiple time ranges to remove, such as 10-20s and 80-100s
-- **Expert Mode MVP**: Preview video, seek to a timestamp, set in/out points, and add delete ranges
-- **Basic Subtitles**: Add manual subtitles, import SRT files, and burn subtitles into exported video
+- **Expert Workbench**: Auto-maximized editor with preview, drag selection on the timeline, delete selection, and delete current frame
+- **ASS Subtitle Pipeline**: Import ASS/SRT, import from clipboard, edit in a subtitle list, preview live, and burn hard subtitles on export
 - **Resolution Options**: Support for multiple common resolutions
 - **Video Preview**: Show the first frame after selecting a file
 - **Open Output Folder**: Automatically open the output folder after processing
@@ -93,7 +93,9 @@ video-clipper/
 ├── main.py          # Main entry point
 ├── gui.py           # PySide6 GUI
 ├── edit_model.py    # Unified edit model
-├── subtitle_model.py # Subtitle model and SRT I/O
+├── subtitle_model.py # Subtitle project model and ASS/SRT I/O
+├── timeline_state.py # Timeline logic
+├── timeline_widget.py # Expert timeline widget
 ├── ffmpeg_utils.py  # FFmpeg utilities
 ├── requirements.txt # Python dependencies
 ├── build_spec.bat   # One-click build script
@@ -109,9 +111,10 @@ video-clipper/
 
 ## Tech Stack
 
-- Python 3.8+
+- Python 3.10+
 - PySide6 (GUI framework)
 - FFmpeg (Video processing)
+- pysubs2 (Subtitle parsing and ASS/SRT conversion)
 - PyInstaller (Packaging tool)
 
 ---

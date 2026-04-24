@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from math import isfinite
 from typing import Optional, Tuple
 
-from subtitle_model import SubtitleTrack, SubtitleValidationError
+from subtitle_model import SubtitleProject, SubtitleValidationError
 
 
 class PlanValidationError(ValueError):
@@ -141,7 +141,7 @@ class EditPlan:
     skip_seconds: float = 0
     delete_ranges: Tuple[DeleteRange, ...] = field(default_factory=tuple)
     output: OutputOptions = field(default_factory=OutputOptions)
-    subtitles: SubtitleTrack = field(default_factory=SubtitleTrack)
+    subtitles: SubtitleProject = field(default_factory=SubtitleProject)
     has_audio: bool = True
 
     def normalized(self, total_duration=None):
@@ -152,7 +152,7 @@ class EditPlan:
             total_duration=total_duration,
         )
         try:
-            subtitles = self.subtitles.normalized() if self.subtitles is not None else SubtitleTrack()
+            subtitles = self.subtitles.normalized() if self.subtitles is not None else SubtitleProject()
         except SubtitleValidationError as exc:
             raise PlanValidationError(str(exc))
 

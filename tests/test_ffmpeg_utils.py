@@ -4,9 +4,12 @@ from pathlib import Path
 from ffmpeg_utils import (
     build_ffmpeg_command,
     build_ffmpeg_command_from_plan,
+    build_ffmpeg_progress_command,
     calculate_output_duration,
+    decode_process_output,
     normalize_delete_ranges,
     prepare_subtitle_file_for_plan,
+    _parse_progress_time_seconds,
 )
 from edit_model import DeleteRange, EditPlan, OutputOptions
 from subtitle_model import SubtitleEntry, SubtitleStyle, SubtitleTrack
@@ -108,7 +111,7 @@ class FfmpegUtilsTest(unittest.TestCase):
         self.assertIn("-ss", cmd)
         self.assertNotIn("-vf", cmd)
 
-    def test_build_command_burns_subtitles_from_plan(self):
+    def test_build_command_burns_ass_subtitles_from_plan(self):
         plan = EditPlan(
             skip_seconds=5,
             subtitles=SubtitleTrack(
@@ -122,30 +125,47 @@ class FfmpegUtilsTest(unittest.TestCase):
             "input.mp4",
             "output.mp4",
             plan,
-            subtitle_path="/tmp/subtitle.srt",
+            subtitle_path="/tmp/subtitle.ass",
         )
 
         filter_text = cmd[cmd.index("-vf") + 1]
         self.assertIn("subtitles=filename=", filter_text)
-        self.assertIn("FontSize=32", filter_text)
-        self.assertIn("MarginV=48", filter_text)
+        self.assertIn("subtitle.ass", filter_text)
         self.assertIn("select='gte(t,5)'", filter_text)
         self.assertNotIn("-ss", cmd)
 
-    def test_prepare_subtitle_file_for_plan_writes_srt(self):
-        plan = EditPlan(
-            subtitles=SubtitleTrack(entries=(SubtitleEntry(1, 2, "字幕"),))
-        )
+    def test_prepare_subtitle_file_for_plan_writes_ass(self):
+        plan = EditPlan(subtitles=SubtitleTrack(entries=(SubtitleEntry(1, 2, "字幕"),)))
 
         subtitle_path = prepare_subtitle_file_for_plan(plan)
         try:
             self.assertIsNotNone(subtitle_path)
+            self.assertTrue(subtitle_path.endswith(".ass"))
             content = Path(subtitle_path).read_text(encoding="utf-8")
-            self.assertIn("00:00:01,000 --> 00:00:02,000", content)
+            self.assertIn("[Events]", content)
+            self.assertIn("Dialogue: 0,0:00:01.00,0:00:02.00", content)
             self.assertIn("字幕", content)
         finally:
             if subtitle_path:
                 Path(subtitle_path).unlink(missing_ok=True)
+
+    def test_build_progress_command_adds_machine_progress_flags(self):
+        cmd = build_ffmpeg_progress_command(["ffmpeg", "-y", "-i", "input.mp4", "output.mp4"])
+
+        self.assertEqual(
+            cmd[:7],
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"],
+        )
+
+    def test_parse_progress_time_seconds_handles_ffmpeg_microseconds(self):
+        self.assertEqual(_parse_progress_time_seconds("out_time_ms", "1000000"), 1)
+        self.assertEqual(_parse_progress_time_seconds("out_time_us", "2500000"), 2.5)
+        self.assertEqual(_parse_progress_time_seconds("out_time", "00:01:02.500000"), 62.5)
+
+    def test_decode_process_output_replaces_invalid_bytes(self):
+        text = decode_process_output(b"abc\x88def")
+        self.assertIn("abc", text)
+        self.assertTrue(len(text) >= 3)
 
 
 if __name__ == "__main__":
