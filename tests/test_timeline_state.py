@@ -7,6 +7,8 @@ from timeline_state import (
     add_delete_range_from_selection,
     add_subtitle_from_selection_or_playhead,
     delete_current_frame,
+    move_timed_range,
+    resize_timed_range,
     selection_from_points,
 )
 
@@ -76,6 +78,31 @@ class TimelineStateTest(unittest.TestCase):
     def test_add_subtitle_from_selection_or_playhead_rejects_blank_text(self):
         with self.assertRaises(SubtitleValidationError):
             add_subtitle_from_selection_or_playhead([], TimelineSelection(1, 2), 0, "   ")
+
+    def test_add_subtitle_from_selection_or_playhead_preserves_raw_tags(self):
+        _cues, new_cue = add_subtitle_from_selection_or_playhead(
+            [],
+            TimelineSelection(1, 2),
+            0,
+            "字幕",
+            raw_tags="{\\fad(200,200)}",
+        )
+
+        self.assertEqual(new_cue.raw_tags, "{\\fad(200,200)}")
+
+    def test_resize_timed_range_keeps_min_duration(self):
+        selection = resize_timed_range(2, 5, "start", 4.99, total_duration=10, min_duration=0.1)
+
+        self.assertAlmostEqual(selection.start, 4.9)
+        self.assertAlmostEqual(selection.end, 5.0)
+
+    def test_move_timed_range_clamps_to_duration(self):
+        selection = move_timed_range(8, 10, 3, total_duration=10)
+
+        self.assertEqual(selection, TimelineSelection(8.0, 10.0))
+
+        selection = move_timed_range(1, 3, -5, total_duration=10)
+        self.assertEqual(selection, TimelineSelection(0.0, 2.0))
 
 
 if __name__ == "__main__":

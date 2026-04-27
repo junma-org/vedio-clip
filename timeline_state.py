@@ -69,6 +69,43 @@ def selection_from_points(start, end, total_duration=None):
     return TimelineSelection(start, end).normalized(total_duration=total_duration)
 
 
+def resize_timed_range(start, end, edge, seconds, total_duration=None, min_duration=0.05):
+    current = TimelineSelection(start, end).normalized(total_duration=total_duration)
+    duration_floor = max(0.001, _as_seconds(min_duration, "最小时长"))
+    target = _clip_to_duration(_as_seconds(seconds, "调整时间"), total_duration)
+
+    if edge == "start":
+        return TimelineSelection(min(target, current.end - duration_floor), current.end).normalized(
+            total_duration=total_duration
+        )
+    if edge == "end":
+        return TimelineSelection(current.start, max(target, current.start + duration_floor)).normalized(
+            total_duration=total_duration
+        )
+
+    raise TimelineStateError("只能调整开始或结束边界。")
+
+
+def move_timed_range(start, end, delta, total_duration=None):
+    current = TimelineSelection(start, end).normalized(total_duration=total_duration)
+    offset = _as_seconds(delta, "移动偏移")
+    if float(delta) < 0:
+        offset = float(delta)
+
+    new_start = current.start + offset
+    new_end = current.end + offset
+    if total_duration is not None:
+        duration = _clip_to_duration(_as_seconds(total_duration, "视频时长"), None)
+        if new_start < 0:
+            new_end -= new_start
+            new_start = 0
+        if new_end > duration:
+            shift = new_end - duration
+            new_start -= shift
+            new_end = duration
+    return TimelineSelection(max(0, new_start), max(0, new_end)).normalized(total_duration=total_duration)
+
+
 def add_delete_range_from_selection(existing_ranges, selection, total_duration=None):
     current = selection.normalized(total_duration=total_duration)
     if not current.is_range:
@@ -114,6 +151,7 @@ def add_subtitle_from_selection_or_playhead(
     default_duration=2.0,
     style_name="short_speech_bottom",
     source_kind="manual",
+    raw_tags="",
 ):
     cue_text = str(text or "").strip()
     if not cue_text:
@@ -140,6 +178,7 @@ def add_subtitle_from_selection_or_playhead(
         text=cue_text,
         style_name=style_name,
         source_kind=source_kind,
+        raw_tags=raw_tags,
     ).normalized()
 
     cues = []

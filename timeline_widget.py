@@ -6,13 +6,14 @@ from PySide6.QtCore import QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from timeline_state import TimelineSelection, selection_from_points
+from timeline_state import TimelineSelection, move_timed_range, resize_timed_range, selection_from_points
 
 
 class TimelineWidget(QWidget):
     playheadChanged = Signal(float)
     selectionChanged = Signal(float, float)
     subtitleActivated = Signal(int)
+    subtitleTimingPreviewed = Signal(int, float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -28,6 +29,9 @@ class TimelineWidget(QWidget):
 
         self._drag_mode = None
         self._drag_anchor = None
+        self._drag_original_selection = None
+        self._drag_subtitle_index = -1
+        self._subtitle_timing_preview = None
         self._press_pos = QPoint()
         self._handle_radius = 6
 
@@ -41,6 +45,12 @@ class TimelineWidget(QWidget):
         else:
             self._playhead = max(0.0, float(seconds or 0.0))
         self.update()
+
+    def _preview_playhead(self, seconds):
+        if self._duration > 0:
+            self._playhead = max(0.0, min(float(seconds or 0.0), self._duration))
+        else:
+            self._playhead = max(0.0, float(seconds or 0.0))
 
     @property
     def playhead(self):
@@ -56,6 +66,7 @@ class TimelineWidget(QWidget):
 
     def set_subtitle_cues(self, cues):
         self._subtitle_cues = list(cues or [])
+        self._subtitle_timing_preview = None
         self.update()
 
     def set_selected_subtitle_index(self, index):
@@ -94,18 +105,32 @@ class TimelineWidget(QWidget):
         end_x = self._time_to_x(self._selection.end)
         return start_x, end_x
 
-    def _subtitle_index_at(self, pos):
+    def _subtitle_times(self, index, cue):
+        if self._subtitle_timing_preview and self._subtitle_timing_preview[0] == index:
+            return self._subtitle_timing_preview[1], self._subtitle_timing_preview[2]
+        return cue.start, cue.end
+
+    def _subtitle_hit_at(self, pos):
         subtitle_rect = self._subtitle_track_rect()
         if not subtitle_rect.contains(pos):
-            return -1
+            return -1, None
 
         for index, cue in enumerate(self._subtitle_cues):
-            start_x = self._time_to_x(cue.start)
-            end_x = self._time_to_x(cue.end)
+            start, end = self._subtitle_times(index, cue)
+            start_x = self._time_to_x(start)
+            end_x = self._time_to_x(end)
             block = QRectF(start_x, subtitle_rect.top(), max(8, end_x - start_x), subtitle_rect.height())
             if block.contains(pos):
-                return index
-        return -1
+                if abs(pos.x() - start_x) <= self._handle_radius:
+                    return index, "start"
+                if abs(pos.x() - end_x) <= self._handle_radius:
+                    return index, "end"
+                return index, None
+        return -1, None
+
+    def _subtitle_index_at(self, pos):
+        index, _edge = self._subtitle_hit_at(pos)
+        return index
 
     def _maybe_update_cursor(self, pos):
         handles = self._selection_handles()
@@ -114,8 +139,9 @@ class TimelineWidget(QWidget):
             if abs(pos.x() - start_x) <= self._handle_radius or abs(pos.x() - end_x) <= self._handle_radius:
                 self.setCursor(QCursor(Qt.SizeHorCursor))
                 return
-        if self._subtitle_index_at(pos) >= 0:
-            self.setCursor(QCursor(Qt.PointingHandCursor))
+        subtitle_index, subtitle_edge = self._subtitle_hit_at(pos)
+        if subtitle_index >= 0:
+            self.setCursor(QCursor(Qt.SizeHorCursor if subtitle_edge else Qt.PointingHandCursor))
             return
         self.setCursor(QCursor(Qt.ArrowCursor))
 
@@ -128,13 +154,30 @@ class TimelineWidget(QWidget):
         self._press_pos = pos
         self._maybe_update_cursor(pos)
 
-        subtitle_index = self._subtitle_index_at(pos)
+        subtitle_index, subtitle_edge = self._subtitle_hit_at(pos)
         if subtitle_index >= 0:
+            if self._subtitle_timing_preview and self._subtitle_timing_preview[0] != subtitle_index:
+                self._subtitle_timing_preview = None
             self.subtitleActivated.emit(subtitle_index)
             cue = self._subtitle_cues[subtitle_index]
+            self._selected_subtitle_index = subtitle_index
             self._selection = TimelineSelection(cue.start, cue.end)
             self.selectionChanged.emit(cue.start, cue.end)
-            self.playheadChanged.emit(cue.start)
+            self._drag_subtitle_index = subtitle_index
+            self._drag_original_selection = self._selection
+            self._drag_anchor = self._x_to_time(pos.x())
+            if subtitle_edge == "start":
+                self._drag_mode = "subtitle_resize_start"
+                self._preview_playhead(cue.start)
+                self.playheadChanged.emit(cue.start)
+            elif subtitle_edge == "end":
+                self._drag_mode = "subtitle_resize_end"
+                self._preview_playhead(cue.end)
+                self.playheadChanged.emit(cue.end)
+            else:
+                self._drag_mode = "subtitle_move"
+                self._preview_playhead(cue.start)
+                self.playheadChanged.emit(cue.start)
             self.update()
             return
 
@@ -143,14 +186,18 @@ class TimelineWidget(QWidget):
             start_x, end_x = handles
             if abs(pos.x() - start_x) <= self._handle_radius:
                 self._drag_mode = "resize_start"
+                self._drag_original_selection = self._selection
                 return
             if abs(pos.x() - end_x) <= self._handle_radius:
                 self._drag_mode = "resize_end"
+                self._drag_original_selection = self._selection
                 return
 
         seconds = self._x_to_time(pos.x())
+        self._subtitle_timing_preview = None
         self._drag_mode = "select"
         self._drag_anchor = seconds
+        self._drag_original_selection = None
         self._selection = TimelineSelection(seconds, seconds)
         self.update()
 
@@ -162,12 +209,59 @@ class TimelineWidget(QWidget):
             return
 
         seconds = self._x_to_time(pos.x())
+        if self._drag_mode.startswith("subtitle_"):
+            self._preview_subtitle_timing(seconds)
+            return
+
         if self._drag_mode == "select":
             self._selection = selection_from_points(self._drag_anchor, seconds, self._duration or None)
         elif self._drag_mode == "resize_start":
             self._selection = selection_from_points(seconds, self._selection.end, self._duration or None)
         elif self._drag_mode == "resize_end":
             self._selection = selection_from_points(self._selection.start, seconds, self._duration or None)
+        self._preview_playhead(seconds)
+        self.playheadChanged.emit(seconds)
+        self.update()
+
+    def _preview_subtitle_timing(self, seconds):
+        if self._drag_subtitle_index < 0 or self._drag_original_selection is None:
+            return
+
+        original = self._drag_original_selection
+        playhead = seconds
+        if self._drag_mode == "subtitle_resize_start":
+            selection = resize_timed_range(
+                original.start,
+                original.end,
+                "start",
+                seconds,
+                total_duration=self._duration or None,
+            )
+            playhead = selection.start
+        elif self._drag_mode == "subtitle_resize_end":
+            selection = resize_timed_range(
+                original.start,
+                original.end,
+                "end",
+                seconds,
+                total_duration=self._duration or None,
+            )
+            playhead = selection.end
+        else:
+            delta = seconds - float(self._drag_anchor or 0.0)
+            selection = move_timed_range(
+                original.start,
+                original.end,
+                delta,
+                total_duration=self._duration or None,
+            )
+            playhead = selection.start
+
+        self._selection = selection
+        self._subtitle_timing_preview = (self._drag_subtitle_index, selection.start, selection.end)
+        self._preview_playhead(playhead)
+        self.subtitleTimingPreviewed.emit(self._drag_subtitle_index, selection.start, selection.end, playhead)
+        self.playheadChanged.emit(playhead)
         self.update()
 
     def mouseReleaseEvent(self, event):
@@ -178,7 +272,11 @@ class TimelineWidget(QWidget):
         released_time = self._x_to_time(event.position().x())
         moved = abs(event.position().toPoint().x() - self._press_pos.x()) >= 4
 
-        if self._drag_mode == "select" and not moved:
+        was_subtitle_drag = self._drag_mode and self._drag_mode.startswith("subtitle_")
+
+        if was_subtitle_drag and not moved:
+            self._subtitle_timing_preview = None
+        elif self._drag_mode == "select" and not moved:
             self._selection = TimelineSelection(released_time, released_time)
             self.playheadChanged.emit(released_time)
             self.selectionChanged.emit(released_time, released_time)
@@ -189,6 +287,8 @@ class TimelineWidget(QWidget):
 
         self._drag_mode = None
         self._drag_anchor = None
+        self._drag_original_selection = None
+        self._drag_subtitle_index = -1
         self.update()
 
     def leaveEvent(self, event):
@@ -240,8 +340,9 @@ class TimelineWidget(QWidget):
     def _paint_subtitle_blocks(self, painter, rect):
         painter.setPen(Qt.NoPen)
         for index, cue in enumerate(self._subtitle_cues):
-            start_x = self._time_to_x(cue.start)
-            end_x = self._time_to_x(cue.end)
+            start, end = self._subtitle_times(index, cue)
+            start_x = self._time_to_x(start)
+            end_x = self._time_to_x(end)
             width = max(10, end_x - start_x)
             color = QColor("#2d7ff9") if index != self._selected_subtitle_index else QColor("#ff8a2a")
             painter.setBrush(color)

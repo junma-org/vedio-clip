@@ -9,7 +9,18 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, QRectF, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -22,6 +33,7 @@ except ImportError:
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -29,6 +41,7 @@ from PySide6.QtWidgets import (
     QGraphicsObject,
     QGraphicsScene,
     QGraphicsView,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -67,8 +80,10 @@ from subtitle_model import (
     SubtitleValidationError,
     build_default_subtitle_project,
     build_style_preset,
+    extract_fade_from_tags,
     load_subtitle_file,
     load_subtitle_text,
+    set_fade_on_tags,
 )
 from timeline_state import (
     TimelineSelection,
@@ -98,6 +113,15 @@ STYLE_PRESET_LABELS = {
 }
 DEFAULT_STYLE_PRESET = "short_speech_bottom"
 DEVELOPER_WECHAT = "Summer_1987s"
+RESOLUTION_OPTIONS = (
+    ("保持原分辨率", None),
+    ("1920 x 1080 横屏", (1920, 1080)),
+    ("1280 x 720 横屏", (1280, 720)),
+    ("1080 x 1920 竖屏", (1080, 1920)),
+    ("720 x 1280 竖屏", (720, 1280)),
+    ("1440 x 1920 竖屏", (1440, 1920)),
+    ("720 x 480 标清", (720, 480)),
+)
 
 
 def ass_color_to_qcolor(color_text):
@@ -112,6 +136,11 @@ def ass_color_to_qcolor(color_text):
     except ValueError:
         return QColor("#ffffff")
     return QColor(red, green, blue, alpha)
+
+
+def qcolor_to_ass_color(color):
+    qcolor = QColor(color)
+    return f"&H00{qcolor.blue():02X}{qcolor.green():02X}{qcolor.red():02X}"
 
 
 class VideoProcessThread(QThread):
@@ -472,6 +501,8 @@ class MainWindow(QMainWindow):
         self.expert_duration_seconds = 0.0
         self.expert_fps = 30.0
         self.expert_video_size = (1920, 1080)
+        self.expert_native_video_size = (1920, 1080)
+        self.expert_output_resolution = None
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
 
         self.media_player = None
@@ -480,11 +511,18 @@ class MainWindow(QMainWindow):
         self.video_item = None
         self.subtitle_overlay_item = None
         self._syncing_expert_position = False
+        self._syncing_style_controls = False
+        self._syncing_resolution_controls = False
+        self._subtitle_timing_dirty = False
+        self._subtitle_color = QColor("#ffffff")
+        self._undo_stack = []
+        self._restoring_state = False
         self._saved_window_geometry = None
         self._saved_was_maximized = False
         self._expert_media_path = None
 
         self.init_ui()
+        self.init_shortcuts()
         self.check_ffmpeg()
 
     def init_ui(self):
@@ -536,6 +574,13 @@ class MainWindow(QMainWindow):
 
         self.apply_mode_button_styles()
         self.switch_mode("simple", initial=True)
+
+    def init_shortcuts(self):
+        self.undo_action = QAction(self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.triggered.connect(self.undo_last_operation)
+        self.addAction(self.undo_action)
+        self.update_undo_action_state()
 
     def create_simple_page(self):
         page = QWidget()
@@ -611,12 +656,8 @@ class MainWindow(QMainWindow):
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("输出分辨率"))
         self.res_combo = QComboBox()
-        self.res_combo.addItem("保持原分辨率", None)
-        self.res_combo.addItem("1920 x 1080", (1920, 1080))
-        self.res_combo.addItem("1440 x 1920", (1440, 1920))
-        self.res_combo.addItem("1080 x 1920", (1080, 1920))
-        self.res_combo.addItem("720 x 1280", (720, 1280))
-        self.res_combo.addItem("720 x 480", (720, 480))
+        for label, resolution in RESOLUTION_OPTIONS:
+            self.res_combo.addItem(label, resolution)
         res_layout.addWidget(self.res_combo, 1)
         panel_layout.addLayout(res_layout)
 
@@ -684,7 +725,29 @@ class MainWindow(QMainWindow):
         self.video_scene = QGraphicsScene(self)
         self.expert_preview_view = PreviewGraphicsView(self.video_scene, self)
         self.expert_preview_view.setMinimumHeight(360)
-        self.expert_preview_stack.addWidget(self.expert_preview_view)
+        self.expert_preview_container = QWidget()
+        preview_container_layout = QGridLayout(self.expert_preview_container)
+        preview_container_layout.setContentsMargins(0, 0, 0, 0)
+        preview_container_layout.setSpacing(0)
+        preview_container_layout.addWidget(self.expert_preview_view, 0, 0)
+
+        resolution_overlay = QFrame()
+        resolution_overlay.setStyleSheet(
+            "QFrame { background: rgba(15, 23, 42, 185); border-radius: 8px; }"
+            "QLabel { color: white; }"
+            "QComboBox { min-width: 150px; padding: 3px 6px; }"
+        )
+        resolution_overlay_layout = QHBoxLayout(resolution_overlay)
+        resolution_overlay_layout.setContentsMargins(8, 6, 8, 6)
+        resolution_overlay_layout.setSpacing(6)
+        resolution_overlay_layout.addWidget(QLabel("分辨率"))
+        self.expert_res_combo = QComboBox()
+        for label, resolution in RESOLUTION_OPTIONS:
+            self.expert_res_combo.addItem(label, resolution)
+        self.expert_res_combo.currentIndexChanged.connect(self.on_expert_resolution_changed)
+        resolution_overlay_layout.addWidget(self.expert_res_combo)
+        preview_container_layout.addWidget(resolution_overlay, 0, 0, Qt.AlignRight | Qt.AlignBottom)
+        self.expert_preview_stack.addWidget(self.expert_preview_container)
         left_panel.addWidget(self.expert_preview_stack)
 
         transport_layout = QHBoxLayout()
@@ -708,6 +771,7 @@ class MainWindow(QMainWindow):
         self.timeline_widget.playheadChanged.connect(self.seek_expert_seconds)
         self.timeline_widget.selectionChanged.connect(self.on_timeline_selection_changed)
         self.timeline_widget.subtitleActivated.connect(self.select_subtitle_row)
+        self.timeline_widget.subtitleTimingPreviewed.connect(self.on_subtitle_timing_previewed)
         left_panel.addWidget(self.timeline_widget)
 
         delete_actions_layout = QHBoxLayout()
@@ -746,11 +810,40 @@ class MainWindow(QMainWindow):
         style_layout = QHBoxLayout()
         style_layout.addWidget(QLabel("字幕模板"))
         self.subtitle_style_combo = QComboBox()
+        self.subtitle_style_combo.currentIndexChanged.connect(self.on_subtitle_style_changed)
         style_layout.addWidget(self.subtitle_style_combo, 1)
         self.apply_preset_button = QPushButton("应用")
         self.apply_preset_button.clicked.connect(self.apply_selected_style)
         style_layout.addWidget(self.apply_preset_button)
         side_layout.addLayout(style_layout)
+
+        style_edit_layout = QHBoxLayout()
+        style_edit_layout.addWidget(QLabel("字体"))
+        self.subtitle_font_edit = QLineEdit()
+        self.subtitle_font_edit.setPlaceholderText("Microsoft YaHei")
+        style_edit_layout.addWidget(self.subtitle_font_edit, 1)
+        style_edit_layout.addWidget(QLabel("字号"))
+        self.subtitle_font_size_spin = QSpinBox()
+        self.subtitle_font_size_spin.setRange(12, 160)
+        self.subtitle_font_size_spin.setValue(44)
+        style_edit_layout.addWidget(self.subtitle_font_size_spin)
+        side_layout.addLayout(style_edit_layout)
+
+        color_effect_layout = QHBoxLayout()
+        color_effect_layout.addWidget(QLabel("颜色"))
+        self.subtitle_color_button = QPushButton("#FFFFFF")
+        self.subtitle_color_button.clicked.connect(self.choose_subtitle_color)
+        color_effect_layout.addWidget(self.subtitle_color_button)
+        self.subtitle_fade_check = QCheckBox("渐隐渐显")
+        self.subtitle_fade_check.toggled.connect(lambda _checked: self.update_expert_controls_state())
+        color_effect_layout.addWidget(self.subtitle_fade_check)
+        self.subtitle_fade_ms_spin = QSpinBox()
+        self.subtitle_fade_ms_spin.setRange(50, 3000)
+        self.subtitle_fade_ms_spin.setSingleStep(50)
+        self.subtitle_fade_ms_spin.setValue(200)
+        self.subtitle_fade_ms_spin.setSuffix(" ms")
+        color_effect_layout.addWidget(self.subtitle_fade_ms_spin)
+        side_layout.addLayout(color_effect_layout)
 
         import_layout = QHBoxLayout()
         self.import_subtitle_button = QPushButton("导入文件")
@@ -867,6 +960,81 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(DEVELOPER_WECHAT)
         self.status_label.setText(f"已复制微信号: {DEVELOPER_WECHAT}")
 
+    def confirm_clear(self, title, message):
+        return QMessageBox.question(self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    def _combo_index_for_data(self, combo, data):
+        for index in range(combo.count()):
+            if combo.itemData(index) == data:
+                return index
+        return 0
+
+    def snapshot_editor_state(self):
+        subtitle_row = self.current_subtitle_row() if hasattr(self, "subtitle_table") else -1
+        return {
+            "delete_ranges": list(self.delete_ranges),
+            "expert_delete_ranges": list(self.expert_delete_ranges),
+            "expert_selection": self.expert_selection,
+            "expert_output_resolution": self.expert_output_resolution,
+            "subtitle_project": self.subtitle_project,
+            "subtitle_row": subtitle_row,
+        }
+
+    def push_undo_state(self):
+        if self._restoring_state:
+            return
+        self._undo_stack.append(self.snapshot_editor_state())
+        if len(self._undo_stack) > 50:
+            self._undo_stack = self._undo_stack[-50:]
+        self.update_undo_action_state()
+
+    def clear_undo_stack(self):
+        self._undo_stack = []
+        self.update_undo_action_state()
+
+    def update_undo_action_state(self):
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(bool(self._undo_stack) and self.process_thread is None)
+
+    def undo_last_operation(self):
+        if self.process_thread is not None or not self._undo_stack:
+            return
+
+        state = self._undo_stack.pop()
+        self._restoring_state = True
+        try:
+            self.delete_ranges = list(state["delete_ranges"])
+            self.expert_delete_ranges = list(state["expert_delete_ranges"])
+            self.expert_selection = state["expert_selection"]
+            self.expert_output_resolution = state["expert_output_resolution"]
+            self.subtitle_project = state["subtitle_project"].normalized()
+            self._subtitle_timing_dirty = False
+
+            self.refresh_delete_ranges_list()
+            self.refresh_expert_delete_ranges_list()
+            self.refresh_style_combo()
+            self.refresh_subtitle_table()
+            self.timeline_widget.set_selection(self.expert_selection)
+            self.timeline_widget.set_subtitle_cues(self.subtitle_project.cues)
+
+            self._syncing_resolution_controls = True
+            self.expert_res_combo.setCurrentIndex(self._combo_index_for_data(self.expert_res_combo, self.expert_output_resolution))
+            self._syncing_resolution_controls = False
+            self.apply_expert_preview_resolution()
+
+            subtitle_row = state.get("subtitle_row", -1)
+            if 0 <= subtitle_row < len(self.subtitle_project.cues):
+                self.subtitle_table.selectRow(subtitle_row)
+                self.on_subtitle_selection_changed()
+            else:
+                self.subtitle_table.clearSelection()
+                self.on_subtitle_selection_changed()
+            self.status_label.setText("已撤销上一次操作")
+        finally:
+            self._restoring_state = False
+            self.update_undo_action_state()
+            self.update_expert_controls_state()
+
     def open_video_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -915,6 +1083,13 @@ class MainWindow(QMainWindow):
         self.expert_duration_seconds = 0.0
         self.expert_fps = 30.0
         self.expert_video_size = (1920, 1080)
+        self.expert_native_video_size = (1920, 1080)
+        self.expert_output_resolution = None
+        self._subtitle_timing_dirty = False
+        self.clear_undo_stack()
+        self._syncing_resolution_controls = True
+        self.expert_res_combo.setCurrentIndex(0)
+        self._syncing_resolution_controls = False
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
         self.timeline_widget.set_duration(0)
         self.timeline_widget.set_playhead(0)
@@ -925,6 +1100,7 @@ class MainWindow(QMainWindow):
         self.subtitle_start_spin.setValue(0)
         self.subtitle_end_spin.setValue(0)
         self.refresh_style_combo()
+        self.load_style_controls(self.current_style_name())
         self.refresh_expert_delete_ranges_list()
         self.refresh_subtitle_table()
         self.expert_preview_stack.setCurrentWidget(self.expert_preview_empty)
@@ -937,6 +1113,7 @@ class MainWindow(QMainWindow):
         if self.subtitle_overlay_item is not None:
             self.subtitle_overlay_item.set_project(self.subtitle_project)
             self.subtitle_overlay_item.set_current_time(0)
+        self.apply_expert_preview_resolution()
 
     def ensure_expert_media_ready(self):
         if self.current_file is None or self.ffmpeg_path is None:
@@ -949,6 +1126,7 @@ class MainWindow(QMainWindow):
         width = max(1, int(video_info.get("width", 1920) or 1920))
         height = max(1, int(video_info.get("height", 1080) or 1080))
         self.expert_video_size = (width, height)
+        self.expert_native_video_size = (width, height)
         self.expert_fps = float(video_info.get("fps", 30) or 30)
         self.expert_duration_seconds = max(0.0, float(video_info.get("duration", 0) or 0))
 
@@ -957,6 +1135,7 @@ class MainWindow(QMainWindow):
             preset_name = DEFAULT_STYLE_PRESET
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size, preset_name)
         self.refresh_style_combo()
+        self.load_style_controls(self.current_style_name())
         self.refresh_subtitle_table()
         self.timeline_widget.set_duration(self.expert_duration_seconds)
         self.timeline_widget.set_playhead(0)
@@ -968,7 +1147,8 @@ class MainWindow(QMainWindow):
             self.ensure_expert_player()
             self.media_player.stop()
             self.media_player.setSource(QUrl.fromLocalFile(str(self.current_file)))
-            self.expert_preview_stack.setCurrentWidget(self.expert_preview_view)
+            self.apply_expert_preview_resolution()
+            self.expert_preview_stack.setCurrentWidget(self.expert_preview_container)
         else:
             self.expert_preview_empty.setText("当前环境不支持视频预览")
             self.expert_preview_stack.setCurrentWidget(self.expert_preview_empty)
@@ -1004,13 +1184,41 @@ class MainWindow(QMainWindow):
     def on_expert_native_size_changed(self, size):
         width = max(1.0, float(size.width() or 1.0))
         height = max(1.0, float(size.height() or 1.0))
+        self.expert_native_video_size = (int(width), int(height))
+        if self.expert_output_resolution is None:
+            self.expert_video_size = (int(width), int(height))
+        self.apply_expert_preview_resolution()
+
+    def current_preview_size(self):
+        return self.expert_output_resolution or self.expert_native_video_size or self.expert_video_size
+
+    def apply_expert_preview_resolution(self):
+        if self.video_scene is None:
+            return
+
+        width, height = self.current_preview_size()
+        width = max(1, int(width or 1))
+        height = max(1, int(height or 1))
         self.video_scene.setSceneRect(QRectF(0, 0, width, height))
         if self.video_item is not None:
             self.video_item.setSize(self.video_scene.sceneRect().size())
         if self.subtitle_overlay_item is not None:
             self.subtitle_overlay_item.set_canvas_size(width, height)
             self.subtitle_overlay_item.set_project(self.subtitle_project)
-        self.expert_preview_view.fitInView(self.video_scene.sceneRect(), Qt.KeepAspectRatio)
+            self.subtitle_overlay_item.set_current_time(self.current_expert_seconds())
+        if hasattr(self, "expert_preview_view"):
+            self.expert_preview_view.fitInView(self.video_scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def on_expert_resolution_changed(self):
+        if self._syncing_resolution_controls:
+            return
+
+        self.push_undo_state()
+        self.expert_output_resolution = self.expert_res_combo.currentData()
+        self.apply_expert_preview_resolution()
+        label = self.expert_res_combo.currentText()
+        self.status_label.setText(f"达人模式输出分辨率: {label}")
+        self.update_expert_controls_state()
 
     def on_expert_duration_changed(self, milliseconds):
         self.expert_duration_seconds = max(self.expert_duration_seconds, milliseconds / 1000)
@@ -1063,6 +1271,9 @@ class MainWindow(QMainWindow):
         target_ms = max(0, int(float(seconds) * 1000))
         if self.media_player is not None:
             self.media_player.setPosition(target_ms)
+            self.expert_current_label.setText(format_time(float(seconds)))
+            if self.subtitle_overlay_item is not None:
+                self.subtitle_overlay_item.set_current_time(float(seconds))
         else:
             self.timeline_widget.set_playhead(seconds)
             if self.subtitle_overlay_item is not None:
@@ -1078,6 +1289,19 @@ class MainWindow(QMainWindow):
         self.timeline_widget.set_selection(self.expert_selection)
         self.update_expert_controls_state()
 
+    def on_subtitle_timing_previewed(self, row, start, end, _playhead):
+        if row < 0 or row >= len(self.subtitle_project.cues):
+            return
+        if self.current_subtitle_row() != row:
+            self.subtitle_table.selectRow(row)
+        self._subtitle_timing_dirty = True
+        self.expert_selection = TimelineSelection(start, end)
+        self.subtitle_start_spin.setValue(start)
+        self.subtitle_end_spin.setValue(end)
+        self.timeline_widget.set_selection(self.expert_selection)
+        self.status_label.setText("已预览字幕时间调整，点击“更新”确认修改")
+        self.update_expert_controls_state()
+
     def refresh_style_combo(self):
         current = self.current_style_name()
         extra_styles = [style.name for style in self.subtitle_project.styles if style.name not in STYLE_PRESET_LABELS]
@@ -1091,10 +1315,116 @@ class MainWindow(QMainWindow):
         index = max(0, self.subtitle_style_combo.findData(target))
         self.subtitle_style_combo.setCurrentIndex(index)
         self.subtitle_style_combo.blockSignals(False)
+        self.load_style_controls(self.current_style_name())
 
     def current_style_name(self):
         style_name = self.subtitle_style_combo.currentData() if hasattr(self, "subtitle_style_combo") else None
         return style_name or DEFAULT_STYLE_PRESET
+
+    def style_for_name(self, style_name):
+        style_map = self.subtitle_project.style_map()
+        if style_name in style_map:
+            return style_map[style_name]
+        try:
+            return build_style_preset(style_name, self.expert_video_size)
+        except SubtitleValidationError:
+            return self.subtitle_project.style
+
+    def set_subtitle_color_button(self, color):
+        self._subtitle_color = QColor(color)
+        text = self._subtitle_color.name().upper()
+        foreground = "#111827" if self._subtitle_color.lightness() > 150 else "#ffffff"
+        self.subtitle_color_button.setText(text)
+        self.subtitle_color_button.setStyleSheet(
+            f"QPushButton {{ background: {text}; color: {foreground}; border: 1px solid #94a3b8; padding: 4px 8px; }}"
+        )
+
+    def load_style_controls(self, style_name=None):
+        if not hasattr(self, "subtitle_font_edit"):
+            return
+        style = self.style_for_name(style_name or self.current_style_name())
+        self._syncing_style_controls = True
+        self.subtitle_font_edit.setText(style.font_name)
+        self.subtitle_font_size_spin.setValue(style.font_size)
+        self.set_subtitle_color_button(ass_color_to_qcolor(style.primary_color))
+        self._syncing_style_controls = False
+
+    def load_effect_controls(self, cue=None):
+        if not hasattr(self, "subtitle_fade_check"):
+            return
+        fade = extract_fade_from_tags(cue.raw_tags if cue else "")
+        self._syncing_style_controls = True
+        self.subtitle_fade_check.setChecked(fade is not None)
+        if fade is not None:
+            self.subtitle_fade_ms_spin.setValue(max(50, min(3000, max(fade))))
+        self._syncing_style_controls = False
+
+    def on_subtitle_style_changed(self):
+        if self._syncing_style_controls:
+            return
+        self.load_style_controls(self.current_style_name())
+
+    def choose_subtitle_color(self):
+        color = QColorDialog.getColor(self._subtitle_color, self, "选择字幕颜色")
+        if color.isValid():
+            self.set_subtitle_color_button(color)
+
+    def style_from_controls(self, style_name):
+        base = self.style_for_name(style_name)
+        return SubtitleStyleDef(
+            name=style_name,
+            font_name=self.subtitle_font_edit.text().strip() or base.font_name,
+            font_size=self.subtitle_font_size_spin.value(),
+            primary_color=qcolor_to_ass_color(self._subtitle_color),
+            secondary_color=base.secondary_color,
+            outline_color=base.outline_color,
+            back_color=base.back_color,
+            bold=base.bold,
+            italic=base.italic,
+            underline=base.underline,
+            strike_out=base.strike_out,
+            scale_x=base.scale_x,
+            scale_y=base.scale_y,
+            spacing=base.spacing,
+            angle=base.angle,
+            border_style=base.border_style,
+            outline=base.outline,
+            shadow=base.shadow,
+            alignment=base.alignment,
+            margin_l=base.margin_l,
+            margin_r=base.margin_r,
+            margin_v=base.margin_v,
+            encoding=base.encoding,
+        ).normalized()
+
+    def apply_style_controls_to_project(self, project, style_name):
+        base = project.normalized()
+        style = self.style_from_controls(style_name)
+        styles = []
+        replaced = False
+        for existing in base.styles:
+            if existing.name == style.name:
+                styles.append(style)
+                replaced = True
+            else:
+                styles.append(existing)
+        if not replaced:
+            styles.append(style)
+        return SubtitleProject(
+            cues=base.cues,
+            styles=tuple(styles),
+            script_info=base.script_info,
+            enabled=base.enabled,
+            play_res_x=base.play_res_x,
+            play_res_y=base.play_res_y,
+            default_style_name=base.default_style_name,
+        ).normalized()
+
+    def raw_tags_from_effect_controls(self, original_raw_tags=""):
+        if self.subtitle_fade_check.isChecked():
+            fade_ms = self.subtitle_fade_ms_spin.value()
+            return set_fade_on_tags(original_raw_tags, fade_ms, fade_ms)
+        return set_fade_on_tags(original_raw_tags, None, None)
 
     def ensure_style_exists(self, style_name):
         base = self.subtitle_project.normalized()
@@ -1152,6 +1482,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "删除片段失败", str(exc))
             return
 
+        self.push_undo_state()
         self.expert_delete_ranges = [item.as_tuple() for item in ranges]
         self.expert_selection = TimelineSelection(self.expert_selection.end, self.expert_selection.end)
         self.timeline_widget.set_selection(self.expert_selection)
@@ -1171,6 +1502,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "删除当前帧失败", str(exc))
             return
 
+        self.push_undo_state()
         self.expert_delete_ranges = [item.as_tuple() for item in ranges]
         self.refresh_expert_delete_ranges_list()
         self.status_label.setText(f"已删除当前帧，共 {len(self.expert_delete_ranges)} 段")
@@ -1179,6 +1511,7 @@ class MainWindow(QMainWindow):
         row = self.expert_delete_ranges_list.currentRow()
         if row < 0 or row >= len(self.expert_delete_ranges):
             return
+        self.push_undo_state()
         del self.expert_delete_ranges[row]
         self.refresh_expert_delete_ranges_list()
         self.status_label.setText(f"已删除片段，剩余 {len(self.expert_delete_ranges)} 段")
@@ -1186,6 +1519,9 @@ class MainWindow(QMainWindow):
     def clear_expert_delete_ranges(self):
         if not self.expert_delete_ranges:
             return
+        if not self.confirm_clear("清空删除片段", f"确定清空全部 {len(self.expert_delete_ranges)} 个删除片段吗？"):
+            return
+        self.push_undo_state()
         self.expert_delete_ranges = []
         self.refresh_expert_delete_ranges_list()
         self.status_label.setText("已清空删除片段")
@@ -1223,16 +1559,20 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.subtitle_project.cues):
             self.subtitle_start_spin.setValue(0)
             self.subtitle_end_spin.setValue(0)
+            self.load_effect_controls(None)
             self.update_subtitle_buttons()
             return
 
         cue = self.subtitle_project.cues[row]
+        self._subtitle_timing_dirty = False
         self.subtitle_start_spin.setValue(cue.start)
         self.subtitle_end_spin.setValue(cue.end)
         self.subtitle_text_edit.setPlainText(cue.text)
         combo_index = self.subtitle_style_combo.findData(cue.style_name)
         if combo_index >= 0:
             self.subtitle_style_combo.setCurrentIndex(combo_index)
+        self.load_style_controls(cue.style_name)
+        self.load_effect_controls(cue)
         self.expert_selection = TimelineSelection(cue.start, cue.end)
         self.timeline_widget.set_selection(self.expert_selection)
         self.update_subtitle_buttons()
@@ -1242,6 +1582,7 @@ class MainWindow(QMainWindow):
         row = self.current_subtitle_row()
         has_selection = row >= 0
         has_entries = bool(self.subtitle_project.cues)
+        self.update_subtitle_button.setText("更新*" if self._subtitle_timing_dirty else "更新")
         self.update_subtitle_button.setEnabled(enabled and has_selection)
         self.remove_subtitle_button.setEnabled(enabled and has_selection)
         self.clear_subtitles_button.setEnabled(enabled and has_entries)
@@ -1259,12 +1600,14 @@ class MainWindow(QMainWindow):
                 total_duration=self.expert_duration_seconds or None,
                 default_duration=2.0,
                 style_name=style_name,
+                raw_tags=self.raw_tags_from_effect_controls(""),
             )
         except (SubtitleValidationError, TimelineStateError) as exc:
             QMessageBox.warning(self, "加字幕失败", str(exc))
             return
 
         project = self.ensure_style_exists(style_name)
+        project = self.apply_style_controls_to_project(project, style_name)
         project = SubtitleProject(
             cues=cues,
             styles=project.styles,
@@ -1274,6 +1617,7 @@ class MainWindow(QMainWindow):
             play_res_y=project.play_res_y,
             default_style_name=project.default_style_name,
         ).normalized()
+        self.push_undo_state()
         self.replace_subtitle_project(project)
         row = project.cues.index(new_cue)
         self.select_subtitle_row(row)
@@ -1286,6 +1630,7 @@ class MainWindow(QMainWindow):
 
         style_name = self.current_style_name()
         project = self.ensure_style_exists(style_name)
+        project = self.apply_style_controls_to_project(project, style_name)
         original = project.cues[row]
         try:
             cue = SubtitleCue(
@@ -1294,7 +1639,7 @@ class MainWindow(QMainWindow):
                 text=self.subtitle_text_edit.toPlainText(),
                 style_name=style_name,
                 source_kind=original.source_kind,
-                raw_tags=original.raw_tags,
+                raw_tags=self.raw_tags_from_effect_controls(original.raw_tags),
                 raw_text="",
                 layer=original.layer,
             ).normalized()
@@ -1313,8 +1658,10 @@ class MainWindow(QMainWindow):
             play_res_y=project.play_res_y,
             default_style_name=project.default_style_name,
         ).normalized()
+        self.push_undo_state()
         self.replace_subtitle_project(updated)
         self.select_subtitle_row(row)
+        self._subtitle_timing_dirty = False
         self.status_label.setText("已更新字幕")
 
     def remove_selected_subtitle(self):
@@ -1333,11 +1680,14 @@ class MainWindow(QMainWindow):
             play_res_y=self.subtitle_project.play_res_y,
             default_style_name=self.subtitle_project.default_style_name,
         ).normalized()
+        self.push_undo_state()
         self.replace_subtitle_project(project)
         self.status_label.setText(f"已删除字幕，剩余 {len(project.cues)} 条")
 
     def clear_subtitles(self):
         if not self.subtitle_project.cues:
+            return
+        if not self.confirm_clear("清空字幕", f"确定清空全部 {len(self.subtitle_project.cues)} 条字幕吗？"):
             return
 
         project = SubtitleProject(
@@ -1349,6 +1699,7 @@ class MainWindow(QMainWindow):
             play_res_y=self.subtitle_project.play_res_y,
             default_style_name=self.subtitle_project.default_style_name,
         ).normalized()
+        self.push_undo_state()
         self.replace_subtitle_project(project)
         self.subtitle_text_edit.clear()
         self.status_label.setText("已清空字幕")
@@ -1356,8 +1707,10 @@ class MainWindow(QMainWindow):
     def apply_selected_style(self):
         style_name = self.current_style_name()
         project = self.ensure_style_exists(style_name)
+        project = self.apply_style_controls_to_project(project, style_name)
         row = self.current_subtitle_row()
         if row < 0 or row >= len(project.cues):
+            self.push_undo_state()
             self.replace_subtitle_project(project)
             self.status_label.setText(f"已准备模板: {self.subtitle_style_combo.currentText()}")
             return
@@ -1370,7 +1723,7 @@ class MainWindow(QMainWindow):
             text=cue.text,
             style_name=style_name,
             source_kind=cue.source_kind,
-            raw_tags=cue.raw_tags,
+            raw_tags=self.raw_tags_from_effect_controls(cue.raw_tags),
             raw_text="",
             layer=cue.layer,
         )
@@ -1383,6 +1736,7 @@ class MainWindow(QMainWindow):
             play_res_y=project.play_res_y,
             default_style_name=project.default_style_name,
         ).normalized()
+        self.push_undo_state()
         self.replace_subtitle_project(updated)
         self.select_subtitle_row(row)
         self.status_label.setText("已应用字幕模板")
@@ -1407,6 +1761,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "字幕导入失败", str(exc))
             return
 
+        self.push_undo_state()
         self.replace_subtitle_project(project)
         self.status_label.setText(f"已导入字幕 {len(project.cues)} 条")
 
@@ -1426,6 +1781,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "字幕导入失败", str(exc))
             return
 
+        self.push_undo_state()
         self.replace_subtitle_project(project)
         self.status_label.setText(f"已导入字幕 {len(project.cues)} 条")
 
@@ -1446,6 +1802,12 @@ class MainWindow(QMainWindow):
         self.subtitle_end_spin.setEnabled(enabled)
         self.add_subtitle_button.setEnabled(enabled and bool(self.subtitle_text_edit.toPlainText().strip()))
         self.subtitle_style_combo.setEnabled(enabled)
+        self.subtitle_font_edit.setEnabled(enabled)
+        self.subtitle_font_size_spin.setEnabled(enabled)
+        self.subtitle_color_button.setEnabled(enabled)
+        self.subtitle_fade_check.setEnabled(enabled)
+        self.subtitle_fade_ms_spin.setEnabled(enabled and self.subtitle_fade_check.isChecked())
+        self.expert_res_combo.setEnabled(enabled)
         self.update_expert_delete_range_buttons()
         self.update_subtitle_buttons()
 
@@ -1455,6 +1817,7 @@ class MainWindow(QMainWindow):
         self.start_button_expert.setEnabled(can_start)
         self.cancel_button_simple.setEnabled(self.process_thread is not None)
         self.cancel_button_expert.setEnabled(self.process_thread is not None)
+        self.update_undo_action_state()
 
     def update_delete_range_controls(self, enabled):
         processing = self.process_thread is not None
@@ -1475,6 +1838,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "删除区间无效", "结束秒数必须大于开始秒数。")
             return
         before = len(self.delete_ranges)
+        self.push_undo_state()
         self.delete_ranges = normalize_delete_ranges(self.delete_ranges + [(start, end)])
         self.refresh_delete_ranges_list()
         if len(self.delete_ranges) < before + 1:
@@ -1486,6 +1850,7 @@ class MainWindow(QMainWindow):
         row = self.delete_ranges_list.currentRow()
         if row < 0 or row >= len(self.delete_ranges):
             return
+        self.push_undo_state()
         del self.delete_ranges[row]
         self.refresh_delete_ranges_list()
         self.status_label.setText(f"已删除选中区间，剩余 {len(self.delete_ranges)} 个")
@@ -1493,6 +1858,9 @@ class MainWindow(QMainWindow):
     def clear_delete_ranges(self):
         if not self.delete_ranges:
             return
+        if not self.confirm_clear("清空删除区间", f"确定清空全部 {len(self.delete_ranges)} 个删除区间吗？"):
+            return
+        self.push_undo_state()
         self.delete_ranges = []
         self.refresh_delete_ranges_list()
         self.status_label.setText("已清空删除区间")
@@ -1553,6 +1921,7 @@ class MainWindow(QMainWindow):
         try:
             return EditPlan(
                 delete_ranges=tuple(DeleteRange(start, end) for start, end in self.expert_delete_ranges),
+                output=OutputOptions(resolution=self.expert_output_resolution),
                 subtitles=self.subtitle_project,
             ).validate()
         except (PlanValidationError, SubtitleValidationError) as exc:

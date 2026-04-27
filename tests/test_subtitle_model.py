@@ -6,12 +6,16 @@ from subtitle_model import (
     SubtitleTrack,
     SubtitleValidationError,
     add_subtitle_from_marks,
+    build_style_preset,
+    extract_fade_from_tags,
     format_srt_timestamp,
     load_ass_text,
     load_subtitle_text,
     parse_srt_text,
     serialize_ass_project,
     serialize_srt_entries,
+    set_fade_on_tags,
+    strip_fade_from_tags,
 )
 
 
@@ -117,8 +121,28 @@ Dialogue: 0,0:00:01.00,0:00:03.00,custom,,0000,0000,0000,,{\\b1}Hello\\NWorld
         self.assertIn("Dialogue: 0,0:00:01.00,0:00:02.00,short_speech_bottom", content)
         self.assertIn("字幕", content)
 
+    def test_serialize_ass_project_writes_fade_tags(self):
+        project = SubtitleTrack(entries=(SubtitleEntry(1, 2, "字幕", raw_tags="{\\fad(200,200)}"),))
+
+        content = serialize_ass_project(project)
+
+        self.assertIn("{\\fad(200,200)}字幕", content)
+
     def test_format_srt_timestamp_rounds_milliseconds(self):
         self.assertEqual(format_srt_timestamp(3661.2345), "01:01:01,234")
+
+    def test_short_speech_preset_sits_in_lower_third_for_vertical_video(self):
+        style = build_style_preset("short_speech_bottom", (1080, 1920))
+
+        self.assertEqual(style.alignment, 2)
+        self.assertEqual(style.margin_v, 614)
+
+    def test_fade_tag_helpers_preserve_other_ass_tags(self):
+        raw_tags = "{\\b1\\fad(100,200)}{\\i1}"
+
+        self.assertEqual(extract_fade_from_tags(raw_tags), (100, 200))
+        self.assertEqual(strip_fade_from_tags(raw_tags), "{\\b1}{\\i1}")
+        self.assertEqual(set_fade_on_tags(raw_tags, 250, 300), "{\\fad(250,300)}{\\b1}{\\i1}")
 
 
 if __name__ == "__main__":

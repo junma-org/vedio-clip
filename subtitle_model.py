@@ -24,6 +24,8 @@ _SRT_TIME_RE = re.compile(
 _ASS_SECTION_RE = re.compile(r"^\[(?P<section>[^\]]+)\]\s*$")
 _ASS_TAG_RE = re.compile(r"\{[^}]*\}")
 _ASS_LEADING_TAG_RE = re.compile(r"^(?P<tags>(?:\{[^}]*\})+)")
+_ASS_TAG_BODY_RE = re.compile(r"\{(?P<body>[^}]*)\}")
+_ASS_FADE_COMMAND_RE = re.compile(r"\\fad\s*\(\s*(?P<in>\d+)\s*,\s*(?P<out>\d+)\s*\)")
 _ASS_TIME_RE = re.compile(r"^\d+:\d{2}:\d{2}\.\d{2}$")
 
 _ASS_STYLE_FIELDS = [
@@ -209,6 +211,39 @@ def extract_leading_ass_tags(text):
     content = str(text or "")
     match = _ASS_LEADING_TAG_RE.match(content)
     return match.group("tags") if match else ""
+
+
+def extract_fade_from_tags(raw_tags):
+    tags = extract_leading_ass_tags(raw_tags)
+    match = _ASS_FADE_COMMAND_RE.search(tags)
+    if not match:
+        return None
+    return int(match.group("in")), int(match.group("out"))
+
+
+def strip_fade_from_tags(raw_tags):
+    tags = extract_leading_ass_tags(raw_tags)
+    if not tags:
+        return ""
+
+    cleaned_tags = []
+    for match in _ASS_TAG_BODY_RE.finditer(tags):
+        body = _ASS_FADE_COMMAND_RE.sub("", match.group("body"))
+        if body:
+            cleaned_tags.append(f"{{{body}}}")
+    return "".join(cleaned_tags)
+
+
+def set_fade_on_tags(raw_tags, fade_in_ms=None, fade_out_ms=None):
+    tags = strip_fade_from_tags(raw_tags)
+    if fade_in_ms is None or fade_out_ms is None:
+        return tags
+
+    fade_in = _as_int(fade_in_ms, "字幕渐显时长")
+    fade_out = _as_int(fade_out_ms, "字幕渐隐时长")
+    if fade_in < 0 or fade_out < 0:
+        raise SubtitleValidationError("字幕渐隐渐显时长不能小于 0。")
+    return f"{{\\fad({fade_in},{fade_out})}}{tags}"
 
 
 def plain_text_to_ass_text(text, raw_tags=""):
@@ -616,26 +651,28 @@ def build_style_preset(preset_id="short_speech_bottom", video_size=None):
         "short_speech_bottom": SubtitleStyleDef(
             name="short_speech_bottom",
             font_name="Microsoft YaHei",
-            font_size=max(24, int(round(38 * scale))),
+            font_size=max(30, int(round(44 * scale))),
             primary_color="&H00FFFFFF",
             outline_color="&H00000000",
             back_color="&H64000000",
             bold=True,
-            outline=2.6,
+            outline=3.2,
+            shadow=1.0,
             alignment=2,
             margin_l=max(40, int(round(width * 0.04))),
             margin_r=max(40, int(round(width * 0.04))),
-            margin_v=max(40, int(round(height * 0.065))),
+            margin_v=max(40, int(round(height * 0.32))),
         ),
         "center_emphasis": SubtitleStyleDef(
             name="center_emphasis",
             font_name="Microsoft YaHei",
-            font_size=max(28, int(round(46 * scale))),
-            primary_color="&H00B8F6FF",
-            outline_color="&H000A1F2E",
+            font_size=max(34, int(round(54 * scale))),
+            primary_color="&H0000E8FF",
+            outline_color="&H00201A00",
             back_color="&H00000000",
             bold=True,
-            outline=3.0,
+            outline=3.8,
+            shadow=1.4,
             alignment=5,
             margin_l=max(40, int(round(width * 0.04))),
             margin_r=max(40, int(round(width * 0.04))),
@@ -643,13 +680,14 @@ def build_style_preset(preset_id="short_speech_bottom", video_size=None):
         ),
         "top_note": SubtitleStyleDef(
             name="top_note",
-            font_name="Microsoft YaHei",
-            font_size=max(20, int(round(30 * scale))),
-            primary_color="&H00FFFFFF",
-            outline_color="&H00303030",
+            font_name="Microsoft JhengHei",
+            font_size=max(22, int(round(32 * scale))),
+            primary_color="&H00EAF7FF",
+            outline_color="&H00403321",
             back_color="&H50000000",
             bold=False,
-            outline=2.0,
+            outline=1.8,
+            shadow=0.6,
             alignment=8,
             margin_l=max(40, int(round(width * 0.04))),
             margin_r=max(40, int(round(width * 0.04))),
