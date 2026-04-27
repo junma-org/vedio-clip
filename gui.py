@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, QRectF, QUrl, Signal
+from PySide6.QtCore import QPointF, QThread, QTimer, Qt, QRectF, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -463,11 +463,23 @@ class PreviewGraphicsView(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignCenter)
+        self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+
+    def sync_scene_view(self):
+        if self.scene() is None or self.scene().sceneRect().isNull():
+            return
+        scene_rect = self.scene().sceneRect()
+        self.setSceneRect(scene_rect)
+        self.resetTransform()
+        self.fitInView(scene_rect, Qt.KeepAspectRatio)
+        self.centerOn(scene_rect.center())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.scene() is not None and not self.scene().sceneRect().isNull():
-            self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
+        self.sync_scene_view()
 
 
 class SubtitleOverlayItem(QGraphicsObject):
@@ -1254,8 +1266,12 @@ class MainWindow(QMainWindow):
         self.media_player.setAudioOutput(self.audio_output)
 
         self.video_item = QGraphicsVideoItem()
+        self.video_item.setAspectRatioMode(Qt.IgnoreAspectRatio)
+        self.video_item.setOffset(QPointF(0, 0))
+        self.video_item.setZValue(0)
         self.video_scene.addItem(self.video_item)
         self.subtitle_overlay_item = SubtitleOverlayItem()
+        self.subtitle_overlay_item.setZValue(1)
         self.video_scene.addItem(self.subtitle_overlay_item)
         self.video_scene.setBackgroundBrush(QColor("#000000"))
         self.video_scene.setSceneRect(QRectF(0, 0, 1280, 720))
@@ -1301,8 +1317,16 @@ class MainWindow(QMainWindow):
         if self.video_item is None:
             return
         video_rect = self.video_item_rect_for_canvas(width, height)
+        self.video_item.resetTransform()
+        self.video_item.setAspectRatioMode(Qt.IgnoreAspectRatio)
+        self.video_item.setOffset(QPointF(0, 0))
         self.video_item.setSize(video_rect.size())
         self.video_item.setPos(video_rect.left(), video_rect.top())
+        self.video_item.update()
+
+    def sync_expert_preview_view(self):
+        if hasattr(self, "expert_preview_view"):
+            self.expert_preview_view.sync_scene_view()
 
     def apply_expert_preview_resolution(self):
         if self.video_scene is None:
@@ -1318,8 +1342,9 @@ class MainWindow(QMainWindow):
             self.subtitle_overlay_item.set_canvas_size(width, height)
             self.subtitle_overlay_item.set_project(self.subtitle_project)
             self.subtitle_overlay_item.set_current_time(self.current_expert_seconds())
-        if hasattr(self, "expert_preview_view"):
-            self.expert_preview_view.fitInView(self.video_scene.sceneRect(), Qt.KeepAspectRatio)
+        self.video_scene.update(self.video_scene.sceneRect())
+        self.sync_expert_preview_view()
+        QTimer.singleShot(0, self.sync_expert_preview_view)
 
     def on_expert_resolution_changed(self):
         if self._syncing_resolution_controls:
