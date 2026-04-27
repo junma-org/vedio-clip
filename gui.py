@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QFontDatabase,
     QKeySequence,
     QPainter,
     QPen,
@@ -44,7 +45,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
@@ -113,6 +113,18 @@ STYLE_PRESET_LABELS = {
 }
 DEFAULT_STYLE_PRESET = "short_speech_bottom"
 DEVELOPER_WECHAT = "Summer_1987s"
+FONT_PRESETS = (
+    "Source Han Sans SC",
+    "Noto Sans CJK SC",
+    "HarmonyOS Sans SC",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "PingFang SC",
+    "LXGW WenKai",
+    "Smiley Sans",
+    "SimHei",
+)
+FONT_FILE_EXTENSIONS = {".ttf", ".otf", ".ttc"}
 RESOLUTION_OPTIONS = (
     ("保持原分辨率", None),
     ("1920 x 1080 横屏", (1920, 1080)),
@@ -141,6 +153,65 @@ def ass_color_to_qcolor(color_text):
 def qcolor_to_ass_color(color):
     qcolor = QColor(color)
     return f"&H00{qcolor.blue():02X}{qcolor.green():02X}{qcolor.red():02X}"
+
+
+def runtime_search_dirs():
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass))
+    if getattr(sys, "frozen", False) and getattr(sys, "executable", None):
+        candidates.append(Path(sys.executable).resolve().parent)
+    if sys.argv and sys.argv[0]:
+        candidates.append(Path(sys.argv[0]).resolve().parent)
+    candidates.append(Path(__file__).resolve().parent)
+    candidates.append(Path.cwd())
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except OSError:
+            key = str(candidate)
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def load_bundled_subtitle_fonts():
+    families = []
+    seen = set()
+    for base_dir in runtime_search_dirs():
+        fonts_dir = base_dir / "fonts"
+        if not fonts_dir.exists():
+            continue
+        for font_path in fonts_dir.rglob("*"):
+            if font_path.suffix.lower() not in FONT_FILE_EXTENSIONS:
+                continue
+            font_id = QFontDatabase.addApplicationFont(str(font_path))
+            if font_id < 0:
+                continue
+            for family in QFontDatabase.applicationFontFamilies(font_id):
+                if family not in seen:
+                    families.append(family)
+                    seen.add(family)
+    return families
+
+
+def subtitle_font_options():
+    installed = set(QFontDatabase.families())
+    bundled = load_bundled_subtitle_fonts()
+    options = []
+    for family in (*bundled, *FONT_PRESETS):
+        if family in options:
+            continue
+        if family in bundled or family in installed:
+            options.append(family)
+    if not options:
+        options.append("Microsoft YaHei")
+    return options
 
 
 class VideoProcessThread(QThread):
@@ -503,6 +574,7 @@ class MainWindow(QMainWindow):
         self.expert_video_size = (1920, 1080)
         self.expert_native_video_size = (1920, 1080)
         self.expert_output_resolution = None
+        self.available_subtitle_fonts = subtitle_font_options()
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
 
         self.media_player = None
@@ -799,8 +871,20 @@ class MainWindow(QMainWindow):
         left_panel.addWidget(self.expert_delete_ranges_list)
 
         right_panel = QFrame()
+        right_panel.setObjectName("subtitleSidePanel")
         right_panel.setMinimumWidth(340)
-        right_panel.setStyleSheet("QFrame { background: #f8fbff; border: 1px solid #dbe5ef; border-radius: 12px; }")
+        right_panel.setStyleSheet(
+            "QFrame#subtitleSidePanel { background: #f7fafc; border: 1px solid #d8e1ea; border-radius: 0px; }"
+            "QFrame#subtitleSidePanel QLabel { color: #475569; font-size: 12px; font-weight: 600; }"
+            "QFrame#subtitleSidePanel QComboBox, QFrame#subtitleSidePanel QSpinBox, "
+            "QFrame#subtitleSidePanel QDoubleSpinBox { background: #ffffff; border: 1px solid #cbd5e1; "
+            "border-radius: 4px; padding: 4px 6px; color: #0f172a; }"
+            "QFrame#subtitleSidePanel QPlainTextEdit, QFrame#subtitleSidePanel QTableWidget { "
+            "background: #ffffff; border: 1px solid #d5dde8; border-radius: 4px; color: #0f172a; }"
+            "QFrame#subtitleSidePanel QPushButton { background: #ffffff; border: 1px solid #cbd5e1; "
+            "border-radius: 4px; padding: 5px 10px; color: #1e293b; }"
+            "QFrame#subtitleSidePanel QPushButton:hover { background: #eef5ff; border-color: #9bb8dc; }"
+        )
         content_layout.addWidget(right_panel, 2)
 
         side_layout = QVBoxLayout(right_panel)
@@ -819,9 +903,13 @@ class MainWindow(QMainWindow):
 
         style_edit_layout = QHBoxLayout()
         style_edit_layout.addWidget(QLabel("字体"))
-        self.subtitle_font_edit = QLineEdit()
-        self.subtitle_font_edit.setPlaceholderText("Microsoft YaHei")
-        style_edit_layout.addWidget(self.subtitle_font_edit, 1)
+        self.subtitle_font_combo = QComboBox()
+        self.subtitle_font_combo.setEditable(True)
+        for family in self.available_subtitle_fonts:
+            self.subtitle_font_combo.addItem(family)
+        if self.subtitle_font_combo.lineEdit() is not None:
+            self.subtitle_font_combo.lineEdit().setPlaceholderText("选择或输入字体")
+        style_edit_layout.addWidget(self.subtitle_font_combo, 1)
         style_edit_layout.addWidget(QLabel("字号"))
         self.subtitle_font_size_spin = QSpinBox()
         self.subtitle_font_size_spin.setRange(12, 160)
@@ -1169,8 +1257,9 @@ class MainWindow(QMainWindow):
         self.video_scene.addItem(self.video_item)
         self.subtitle_overlay_item = SubtitleOverlayItem()
         self.video_scene.addItem(self.subtitle_overlay_item)
+        self.video_scene.setBackgroundBrush(QColor("#000000"))
         self.video_scene.setSceneRect(QRectF(0, 0, 1280, 720))
-        self.video_item.setSize(self.video_scene.sceneRect().size())
+        self.update_video_item_geometry(1280, 720)
         self.subtitle_overlay_item.set_canvas_size(1280, 720)
         self.media_player.setVideoOutput(self.video_item)
 
@@ -1192,6 +1281,29 @@ class MainWindow(QMainWindow):
     def current_preview_size(self):
         return self.expert_output_resolution or self.expert_native_video_size or self.expert_video_size
 
+    def video_item_rect_for_canvas(self, width, height):
+        source_width, source_height = self.expert_native_video_size or (width, height)
+        source_width = max(1.0, float(source_width or width or 1.0))
+        source_height = max(1.0, float(source_height or height or 1.0))
+        target_width = max(1.0, float(width or 1.0))
+        target_height = max(1.0, float(height or 1.0))
+        scale = min(target_width / source_width, target_height / source_height)
+        fitted_width = source_width * scale
+        fitted_height = source_height * scale
+        return QRectF(
+            (target_width - fitted_width) / 2,
+            (target_height - fitted_height) / 2,
+            fitted_width,
+            fitted_height,
+        )
+
+    def update_video_item_geometry(self, width, height):
+        if self.video_item is None:
+            return
+        video_rect = self.video_item_rect_for_canvas(width, height)
+        self.video_item.setSize(video_rect.size())
+        self.video_item.setPos(video_rect.left(), video_rect.top())
+
     def apply_expert_preview_resolution(self):
         if self.video_scene is None:
             return
@@ -1199,9 +1311,9 @@ class MainWindow(QMainWindow):
         width, height = self.current_preview_size()
         width = max(1, int(width or 1))
         height = max(1, int(height or 1))
+        self.expert_video_size = (width, height)
         self.video_scene.setSceneRect(QRectF(0, 0, width, height))
-        if self.video_item is not None:
-            self.video_item.setSize(self.video_scene.sceneRect().size())
+        self.update_video_item_geometry(width, height)
         if self.subtitle_overlay_item is not None:
             self.subtitle_overlay_item.set_canvas_size(width, height)
             self.subtitle_overlay_item.set_project(self.subtitle_project)
@@ -1340,11 +1452,15 @@ class MainWindow(QMainWindow):
         )
 
     def load_style_controls(self, style_name=None):
-        if not hasattr(self, "subtitle_font_edit"):
+        if not hasattr(self, "subtitle_font_combo"):
             return
         style = self.style_for_name(style_name or self.current_style_name())
         self._syncing_style_controls = True
-        self.subtitle_font_edit.setText(style.font_name)
+        font_index = self.subtitle_font_combo.findText(style.font_name)
+        if font_index >= 0:
+            self.subtitle_font_combo.setCurrentIndex(font_index)
+        else:
+            self.subtitle_font_combo.setEditText(style.font_name)
         self.subtitle_font_size_spin.setValue(style.font_size)
         self.set_subtitle_color_button(ass_color_to_qcolor(style.primary_color))
         self._syncing_style_controls = False
@@ -1373,7 +1489,7 @@ class MainWindow(QMainWindow):
         base = self.style_for_name(style_name)
         return SubtitleStyleDef(
             name=style_name,
-            font_name=self.subtitle_font_edit.text().strip() or base.font_name,
+            font_name=self.subtitle_font_combo.currentText().strip() or base.font_name,
             font_size=self.subtitle_font_size_spin.value(),
             primary_color=qcolor_to_ass_color(self._subtitle_color),
             secondary_color=base.secondary_color,
@@ -1802,7 +1918,7 @@ class MainWindow(QMainWindow):
         self.subtitle_end_spin.setEnabled(enabled)
         self.add_subtitle_button.setEnabled(enabled and bool(self.subtitle_text_edit.toPlainText().strip()))
         self.subtitle_style_combo.setEnabled(enabled)
-        self.subtitle_font_edit.setEnabled(enabled)
+        self.subtitle_font_combo.setEnabled(enabled)
         self.subtitle_font_size_spin.setEnabled(enabled)
         self.subtitle_color_button.setEnabled(enabled)
         self.subtitle_fade_check.setEnabled(enabled)

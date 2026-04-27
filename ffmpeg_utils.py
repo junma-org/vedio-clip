@@ -401,6 +401,13 @@ def _build_subtitles_filter(subtitle_path):
     return f"subtitles=filename='{escaped_path}'"
 
 
+def _build_resolution_filter(width, height):
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+    )
+
+
 def prepare_subtitle_file_for_plan(edit_plan):
     """把 EditPlan 内的字幕写到临时 ASS 文件，返回文件路径；无字幕则返回 None。"""
     track = edit_plan.normalized().subtitles
@@ -570,7 +577,7 @@ def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_pl
 
     if plan.output.resolution:
         width, height = plan.output.resolution
-        video_filters.append(f'scale={width}:{height}')
+        video_filters.append(_build_resolution_filter(width, height))
 
     if video_filters:
         cmd.extend(['-vf', ','.join(video_filters)])

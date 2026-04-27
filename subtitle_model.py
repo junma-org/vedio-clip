@@ -661,7 +661,7 @@ def build_style_preset(preset_id="short_speech_bottom", video_size=None):
             alignment=2,
             margin_l=max(40, int(round(width * 0.04))),
             margin_r=max(40, int(round(width * 0.04))),
-            margin_v=max(40, int(round(height * 0.32))),
+            margin_v=max(40, int(round(height * 0.37))),
         ),
         "center_emphasis": SubtitleStyleDef(
             name="center_emphasis",

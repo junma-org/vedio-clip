@@ -14,11 +14,18 @@ def required_binary(filename):
         raise FileNotFoundError(f"Required binary not found: {binary_path}")
     return [(str(binary_path), ".")]
 
+
+def optional_data_dir(dirname):
+    data_path = project_dir / dirname
+    if not data_path.exists():
+        return []
+    return [(str(data_path), dirname)]
+
 a = Analysis(
     ['main.py'],
     pathex=[str(project_dir)],
     binaries=required_binary('ffmpeg.exe') + required_binary('ffprobe.exe'),
-    datas=[],
+    datas=optional_data_dir('fonts'),
     hiddenimports=[
         'PySide6.QtCore',
         'PySide6.QtGui',

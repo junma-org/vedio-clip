@@ -92,10 +92,14 @@ class FfmpegUtilsTest(unittest.TestCase):
 
         cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan)
 
+        filter_text = cmd[cmd.index("-vf") + 1]
         self.assertIn(
-            "select='gte(t,5)*not(between(t,10,20))',setpts=N/FRAME_RATE/TB,scale=1280:720",
-            cmd,
+            "select='gte(t,5)*not(between(t,10,20))',setpts=N/FRAME_RATE/TB",
+            filter_text,
         )
+        self.assertIn("scale=1280:720:force_original_aspect_ratio=decrease", filter_text)
+        self.assertIn("pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black", filter_text)
+        self.assertIn("setsar=1", filter_text)
         self.assertIn("-an", cmd)
         self.assertNotIn("-af", cmd)
 

@@ -135,7 +135,7 @@ Dialogue: 0,0:00:01.00,0:00:03.00,custom,,0000,0000,0000,,{\\b1}Hello\\NWorld
         style = build_style_preset("short_speech_bottom", (1080, 1920))
 
         self.assertEqual(style.alignment, 2)
-        self.assertEqual(style.margin_v, 614)
+        self.assertEqual(style.margin_v, 710)
 
     def test_fade_tag_helpers_preserve_other_ass_tags(self):
         raw_tags = "{\\b1\\fad(100,200)}{\\i1}"
