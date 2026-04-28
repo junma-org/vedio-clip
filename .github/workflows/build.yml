@@ -75,6 +75,7 @@ jobs:
           1. 下载 `VideoClipper.exe`
           2. 双击运行
           3. 拖入视频，设置参数，导出
+          4. 首次识别字幕会下载 faster-whisper medium 模型到软件同级 `models` 目录
 
           ## 更新日志 | Changelog
 

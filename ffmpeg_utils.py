@@ -10,7 +10,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from edit_model import DeleteRange, EditPlan, OutputOptions
+from edit_model import DeleteRange, EditPlan, OutputOptions, PlanValidationError
 from edit_model import normalize_delete_ranges as normalize_plan_delete_ranges
 from subtitle_model import export_subtitle_project_to_ass
 
@@ -408,6 +408,61 @@ def _build_resolution_filter(width, height):
     )
 
 
+def _audible_audio_tracks(edit_plan):
+    return tuple(track for track in edit_plan.normalized().audio_tracks if track.volume > 0)
+
+
+def _audio_filter_chain(input_label, output_label, keep_expression=None, volume=None):
+    filters = []
+    if keep_expression:
+        filters.extend([f"aselect='{keep_expression}'", "asetpts=N/SR/TB"])
+    if volume is not None:
+        filters.append(f"volume={_format_filter_number(volume)}")
+    if not filters:
+        filters.append("anull")
+    return f"[{input_label}]{','.join(filters)}[{output_label}]"
+
+
+def _build_audio_mix_filter(source_audio_enabled, audio_tracks, keep_expression=None, output_duration=None):
+    filter_parts = []
+    labels = []
+
+    if source_audio_enabled:
+        output_label = f"a{len(labels)}"
+        filter_parts.append(_audio_filter_chain("0:a:0", output_label, keep_expression=keep_expression))
+        labels.append(output_label)
+
+    for track_index, track in enumerate(audio_tracks, start=1):
+        output_label = f"a{len(labels)}"
+        filter_parts.append(
+            _audio_filter_chain(
+                f"{track_index}:a:0",
+                output_label,
+                keep_expression=keep_expression,
+                volume=track.volume,
+            )
+        )
+        labels.append(output_label)
+
+    if not labels:
+        return None
+
+    tail_filters = []
+    if output_duration is not None and output_duration > 0:
+        tail_filters.extend([f"atrim=0:{_format_filter_number(output_duration)}", "asetpts=N/SR/TB"])
+
+    if len(labels) == 1:
+        tail_filters = tail_filters or ["anull"]
+        filter_parts.append(f"[{labels[0]}]{','.join(tail_filters)}[aout]")
+    else:
+        mix_filter = f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0:normalize=0"
+        if tail_filters:
+            mix_filter = f"{mix_filter},{','.join(tail_filters)}"
+        filter_parts.append("".join(f"[{label}]" for label in labels) + f"{mix_filter}[aout]")
+
+    return ";".join(filter_parts)
+
+
 def prepare_subtitle_file_for_plan(edit_plan):
     """把 EditPlan 内的字幕写到临时 ASS 文件，返回文件路径；无字幕则返回 None。"""
     track = edit_plan.normalized().subtitles
@@ -539,7 +594,14 @@ def run_ffmpeg_with_progress(cmd, expected_duration=None, stop_requested=None, p
     }
 
 
-def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_plan, subtitle_path=None):
+def build_ffmpeg_command_from_plan(
+    ffmpeg_path,
+    input_path,
+    output_path,
+    edit_plan,
+    subtitle_path=None,
+    output_duration=None,
+):
     """
     根据统一编辑模型构建 FFmpeg 剪辑命令。
 
@@ -553,16 +615,20 @@ def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_pl
         list: FFmpeg命令参数列表
     """
     plan = edit_plan.normalized()
+    audio_tracks = _audible_audio_tracks(plan)
     cmd = [ffmpeg_path, '-y', '-i', str(input_path)]
+    for track in audio_tracks:
+        cmd.extend(['-i', track.path])
 
     has_subtitles = bool(subtitle_path and plan.subtitles.has_entries())
+    uses_complex_audio = bool(audio_tracks)
     keep_expression = _build_keep_expression_from_plan(
         plan,
-        include_skip_without_delete=has_subtitles,
+        include_skip_without_delete=has_subtitles or uses_complex_audio,
     )
 
     # 没有中间删除和字幕时沿用 -ss，避免改变既有极简剪开头行为。
-    if plan.skip_seconds > 0 and not plan.delete_ranges and not has_subtitles:
+    if plan.skip_seconds > 0 and not plan.delete_ranges and not has_subtitles and not uses_complex_audio:
         cmd.extend(['-ss', str(plan.skip_seconds)])
 
     # 视频编码器
@@ -587,7 +653,20 @@ def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_pl
         cmd.extend(['-b:v', plan.output.video_bitrate])
 
     # 音频
-    if plan.has_audio:
+    if uses_complex_audio:
+        filter_complex = _build_audio_mix_filter(
+            plan.source_audio_enabled(),
+            audio_tracks,
+            keep_expression=keep_expression,
+            output_duration=output_duration,
+        )
+        if filter_complex:
+            cmd.extend(['-filter_complex', filter_complex])
+            cmd.extend(['-map', '0:v:0', '-map', '[aout]'])
+            cmd.extend(['-c:a', 'aac', '-b:a', plan.output.audio_bitrate])
+        else:
+            cmd.append('-an')
+    elif plan.source_audio_enabled():
         if keep_expression:
             cmd.extend(['-af', f"aselect='{keep_expression}',asetpts=N/SR/TB"])
         cmd.extend(['-c:a', 'aac', '-b:a', plan.output.audio_bitrate])
@@ -602,7 +681,8 @@ def build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, edit_pl
 
 def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0,
                          resolution=None, video_bitrate=None, audio_bitrate='128k',
-                         delete_ranges=None, has_audio=True):
+                         delete_ranges=None, has_audio=True, source_audio_muted=False,
+                         audio_tracks=None, output_duration=None):
     """
     构建FFmpeg剪辑命令。
     兼容旧调用；新代码优先使用 build_ffmpeg_command_from_plan。
@@ -616,8 +696,54 @@ def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0,
             audio_bitrate=audio_bitrate,
         ),
         has_audio=has_audio,
+        source_audio_muted=source_audio_muted,
+        audio_tracks=tuple(audio_tracks or ()),
     )
-    return build_ffmpeg_command_from_plan(ffmpeg_path, input_path, output_path, plan)
+    return build_ffmpeg_command_from_plan(
+        ffmpeg_path,
+        input_path,
+        output_path,
+        plan,
+        output_duration=output_duration,
+    )
+
+
+def build_audio_mixdown_command(
+    ffmpeg_path,
+    input_path,
+    output_path,
+    edit_plan,
+    duration=None,
+    sample_rate=16000,
+):
+    """构建识别用音频混音命令，输出单声道 PCM WAV。"""
+    plan = edit_plan.normalized()
+    audio_tracks = _audible_audio_tracks(plan)
+    source_audio_enabled = plan.source_audio_enabled()
+    if not source_audio_enabled and not audio_tracks:
+        raise PlanValidationError("当前没有可识别的音频。")
+
+    cmd = [str(ffmpeg_path), '-y', '-i', str(input_path)]
+    for track in audio_tracks:
+        cmd.extend(['-i', track.path])
+
+    if audio_tracks:
+        filter_complex = _build_audio_mix_filter(
+            source_audio_enabled,
+            audio_tracks,
+            output_duration=duration,
+        )
+        if not filter_complex:
+            raise PlanValidationError("当前没有可识别的音频。")
+        cmd.extend(['-filter_complex', filter_complex, '-map', '[aout]'])
+    elif source_audio_enabled:
+        cmd.extend(['-map', '0:a:0'])
+
+    if duration is not None and duration > 0:
+        cmd.extend(['-t', _format_filter_number(duration)])
+
+    cmd.extend(['-vn', '-ac', '1', '-ar', str(int(sample_rate)), '-c:a', 'pcm_s16le', str(output_path)])
+    return cmd
 
 
 def format_time(seconds):

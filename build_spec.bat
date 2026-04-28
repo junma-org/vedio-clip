@@ -65,7 +65,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/5] Checking build dependencies...
-%PYTHON_CMD% -c "import PyInstaller, PySide6, pysubs2" >nul 2>nul
+%PYTHON_CMD% -c "import PyInstaller, PySide6, pysubs2, faster_whisper" >nul 2>nul
 if errorlevel 1 (
     echo Missing build dependencies. Installing from requirements.txt...
     %PYTHON_CMD% -m pip install -r requirements.txt
@@ -74,7 +74,7 @@ if errorlevel 1 (
         goto :error
     )
 ) else (
-    echo OK: PyInstaller, PySide6, and pysubs2 are already available.
+    echo OK: PyInstaller, PySide6, pysubs2, and faster-whisper are already available.
 )
 
 echo.
@@ -94,6 +94,7 @@ echo.
 if exist "dist\VideoClipper.exe" (
     echo SUCCESS! Output: dist\VideoClipper.exe
     echo This EXE already contains ffmpeg.exe and ffprobe.exe.
+    echo The faster-whisper medium model is downloaded on first subtitle recognition to models\faster-whisper-medium.
     pause
     exit /b 0
 )

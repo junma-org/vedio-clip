@@ -13,6 +13,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **Delete Ranges**: Add multiple time ranges to remove, such as 10-20s and 80-100s
 - **Expert Workbench**: Auto-maximized editor with preview, drag selection on the timeline, delete selection, and delete current frame
 - **ASS Subtitle Pipeline**: Import ASS/SRT, import from clipboard, edit in a subtitle list, preview live, and burn hard subtitles on export
+- **Speech-to-Subtitles**: Use faster-whisper medium to recognize subtitles from source audio or added audio, with original + English bilingual output by default
+- **Audio Mixing**: Add up to 2 external audio tracks in Expert Mode, adjust each volume, and mute source video audio independently
 - **Resolution Options**: Support for multiple common resolutions
 - **Video Preview**: Show the first frame after selecting a file
 - **Open Output Folder**: Automatically open the output folder after processing
@@ -26,6 +28,7 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - Windows 7/10/11
 - No Python installation required (for packaged version)
 - FFmpeg is bundled in packaged releases
+- The first subtitle recognition downloads the faster-whisper medium model to `models/faster-whisper-medium` next to the app
 
 ---
 
@@ -78,9 +81,17 @@ If running from source, place `ffmpeg.exe` and `ffprobe.exe` in the project fold
 
 ---
 
+## Subtitle Recognition Model
+
+The faster-whisper medium model is not embedded in the single EXE by default. On the first "Recognize" action, the app downloads it to `models/faster-whisper-medium`; later runs reuse it offline.
+
+---
+
 ## Supported Formats
 
 **Input Formats:** MP4, AVI, MKV, MOV, FLV, WMV, WEBM, M4V
+
+**Audio Formats:** MP3, WAV, M4A, AAC, FLAC, OGG, WMA
 
 **Output Format:** MP4 (H.264 encoded, best compatibility)
 
@@ -94,6 +105,7 @@ video-clipper/
 ├── gui.py           # PySide6 GUI
 ├── edit_model.py    # Unified edit model
 ├── subtitle_model.py # Subtitle project model and ASS/SRT I/O
+├── whisper_utils.py # faster-whisper transcription
 ├── timeline_state.py # Timeline logic
 ├── timeline_widget.py # Expert timeline widget
 ├── ffmpeg_utils.py  # FFmpeg utilities
@@ -115,6 +127,7 @@ video-clipper/
 - PySide6 (GUI framework)
 - FFmpeg (Video processing)
 - pysubs2 (Subtitle parsing and ASS/SRT conversion)
+- faster-whisper (Speech-to-subtitles)
 - PyInstaller (Packaging tool)
 
 ---

@@ -54,13 +54,14 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from edit_model import DeleteRange, EditPlan, OutputOptions, PlanValidationError, normalize_delete_ranges
+from edit_model import AudioTrack, DeleteRange, EditPlan, OutputOptions, PlanValidationError, normalize_delete_ranges
 from ffmpeg_utils import (
     build_ffmpeg_command_from_plan,
     build_thumbnail_command,
@@ -93,6 +94,7 @@ from timeline_state import (
     delete_current_frame,
 )
 from timeline_widget import TimelineWidget
+from whisper_utils import WhisperError, transcribe_video_to_project
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {
@@ -104,6 +106,15 @@ SUPPORTED_VIDEO_EXTENSIONS = {
     ".wmv",
     ".webm",
     ".m4v",
+}
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".wav",
+    ".wma",
 }
 
 STYLE_PRESET_LABELS = {
@@ -253,6 +264,7 @@ class VideoProcessThread(QThread):
                 self.output_path,
                 edit_plan,
                 subtitle_path=subtitle_path,
+                output_duration=remaining_duration,
             )
 
             action_parts = []
@@ -262,6 +274,10 @@ class VideoProcessThread(QThread):
                 action_parts.append(f"删除 {format_time(delete_range.start)}-{format_time(delete_range.end)}")
             if edit_plan.subtitles.has_entries():
                 action_parts.append(f"烧录字幕 {len(edit_plan.subtitles.cues)} 条")
+            if edit_plan.source_audio_muted and video_info.get("has_audio", True):
+                action_parts.append("静音源音")
+            if edit_plan.audio_tracks:
+                action_parts.append(f"混音 {len(edit_plan.audio_tracks)} 条音频")
             if not action_parts:
                 action_parts.append("转换视频")
 
@@ -359,6 +375,51 @@ class ThumbnailThread(QThread):
         self.is_running = False
         if self._process and self._process.poll() is None:
             self._process.terminate()
+
+
+class SubtitleTranscribeThread(QThread):
+    progress_updated = Signal(int)
+    status_changed = Signal(str)
+    finished_success = Signal(object)
+    finished_error = Signal(str)
+
+    def __init__(self, ffmpeg_path, input_path, edit_plan, video_size, duration, bilingual=True, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = ffmpeg_path
+        self.input_path = input_path
+        self.edit_plan = edit_plan
+        self.video_size = video_size
+        self.duration = duration
+        self.bilingual = bilingual
+        self._stop_requested = False
+
+    def run(self):
+        try:
+            project = transcribe_video_to_project(
+                self.ffmpeg_path,
+                self.input_path,
+                self.edit_plan,
+                video_size=self.video_size,
+                duration=self.duration,
+                bilingual=self.bilingual,
+                status_callback=self.status_changed.emit,
+                progress_callback=self.progress_updated.emit,
+                stop_requested=lambda: self._stop_requested,
+            )
+        except (PlanValidationError, WhisperError) as exc:
+            self.finished_error.emit(str(exc))
+            return
+        except Exception as exc:
+            self.finished_error.emit(f"字幕识别异常: {exc}")
+            return
+
+        if self._stop_requested:
+            self.finished_error.emit("字幕识别已取消。")
+            return
+        self.finished_success.emit(project)
+
+    def stop(self):
+        self._stop_requested = True
 
 
 class DropArea(QFrame):
@@ -576,6 +637,7 @@ class MainWindow(QMainWindow):
         self.ffmpeg_path = None
         self.ffprobe_path = None
         self.process_thread = None
+        self.transcribe_thread = None
         self.thumbnail_threads = []
 
         self.delete_ranges = []
@@ -586,6 +648,11 @@ class MainWindow(QMainWindow):
         self.expert_video_size = (1920, 1080)
         self.expert_native_video_size = (1920, 1080)
         self.expert_output_resolution = None
+        self.current_video_has_audio = True
+        self.source_audio_muted = False
+        self.audio_tracks = []
+        self.audio_track_volume_spins = []
+        self.audio_track_remove_buttons = []
         self.available_subtitle_fonts = subtitle_font_options()
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
 
@@ -597,6 +664,7 @@ class MainWindow(QMainWindow):
         self._syncing_expert_position = False
         self._syncing_style_controls = False
         self._syncing_resolution_controls = False
+        self._syncing_audio_controls = False
         self._subtitle_timing_dirty = False
         self._subtitle_color = QColor("#ffffff")
         self._undo_stack = []
@@ -891,17 +959,36 @@ class MainWindow(QMainWindow):
             "QFrame#subtitleSidePanel QComboBox, QFrame#subtitleSidePanel QSpinBox, "
             "QFrame#subtitleSidePanel QDoubleSpinBox { background: #ffffff; border: 1px solid #cbd5e1; "
             "border-radius: 4px; padding: 4px 6px; color: #0f172a; }"
-            "QFrame#subtitleSidePanel QPlainTextEdit, QFrame#subtitleSidePanel QTableWidget { "
+            "QFrame#subtitleSidePanel QPlainTextEdit, QFrame#subtitleSidePanel QTableWidget, "
+            "QFrame#subtitleSidePanel QListWidget { "
             "background: #ffffff; border: 1px solid #d5dde8; border-radius: 4px; color: #0f172a; }"
             "QFrame#subtitleSidePanel QPushButton { background: #ffffff; border: 1px solid #cbd5e1; "
             "border-radius: 4px; padding: 5px 10px; color: #1e293b; }"
             "QFrame#subtitleSidePanel QPushButton:hover { background: #eef5ff; border-color: #9bb8dc; }"
+            "QFrame#subtitleSidePanel QTabWidget::pane { border: 0; }"
+            "QFrame#subtitleSidePanel QTabBar::tab { background: transparent; color: #64748b; padding: 7px 12px; }"
+            "QFrame#subtitleSidePanel QTabBar::tab:selected { color: #0f172a; border-bottom: 2px solid #2563eb; }"
         )
         content_layout.addWidget(right_panel, 2)
 
         side_layout = QVBoxLayout(right_panel)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
+
+        self.expert_side_tabs = QTabWidget()
+        side_layout.addWidget(self.expert_side_tabs, 1)
+
+        subtitle_tab = QWidget()
+        subtitle_layout = QVBoxLayout(subtitle_tab)
+        subtitle_layout.setContentsMargins(0, 8, 0, 0)
+        subtitle_layout.setSpacing(10)
+        self.expert_side_tabs.addTab(subtitle_tab, "字幕")
+
+        audio_tab = QWidget()
+        audio_layout = QVBoxLayout(audio_tab)
+        audio_layout.setContentsMargins(0, 8, 0, 0)
+        audio_layout.setSpacing(10)
+        self.expert_side_tabs.addTab(audio_tab, "音频")
 
         style_layout = QHBoxLayout()
         style_layout.addWidget(QLabel("字幕模板"))
@@ -911,7 +998,7 @@ class MainWindow(QMainWindow):
         self.apply_preset_button = QPushButton("应用")
         self.apply_preset_button.clicked.connect(self.apply_selected_style)
         style_layout.addWidget(self.apply_preset_button)
-        side_layout.addLayout(style_layout)
+        subtitle_layout.addLayout(style_layout)
 
         style_edit_layout = QHBoxLayout()
         style_edit_layout.addWidget(QLabel("字体"))
@@ -927,7 +1014,7 @@ class MainWindow(QMainWindow):
         self.subtitle_font_size_spin.setRange(12, 160)
         self.subtitle_font_size_spin.setValue(44)
         style_edit_layout.addWidget(self.subtitle_font_size_spin)
-        side_layout.addLayout(style_edit_layout)
+        subtitle_layout.addLayout(style_edit_layout)
 
         color_effect_layout = QHBoxLayout()
         color_effect_layout.addWidget(QLabel("颜色"))
@@ -943,9 +1030,17 @@ class MainWindow(QMainWindow):
         self.subtitle_fade_ms_spin.setValue(200)
         self.subtitle_fade_ms_spin.setSuffix(" ms")
         color_effect_layout.addWidget(self.subtitle_fade_ms_spin)
-        side_layout.addLayout(color_effect_layout)
+        subtitle_layout.addLayout(color_effect_layout)
 
         import_layout = QHBoxLayout()
+        self.recognize_subtitle_button = QPushButton("识别")
+        self.recognize_subtitle_button.clicked.connect(self.start_subtitle_transcription)
+        import_layout.addWidget(self.recognize_subtitle_button)
+
+        self.bilingual_subtitle_check = QCheckBox("双语")
+        self.bilingual_subtitle_check.setChecked(True)
+        import_layout.addWidget(self.bilingual_subtitle_check)
+
         self.import_subtitle_button = QPushButton("导入文件")
         self.import_subtitle_button.clicked.connect(self.import_subtitle_file)
         import_layout.addWidget(self.import_subtitle_button)
@@ -953,7 +1048,7 @@ class MainWindow(QMainWindow):
         self.import_clipboard_button = QPushButton("导入剪贴板")
         self.import_clipboard_button.clicked.connect(self.import_subtitle_clipboard)
         import_layout.addWidget(self.import_clipboard_button)
-        side_layout.addLayout(import_layout)
+        subtitle_layout.addLayout(import_layout)
 
         self.subtitle_table = QTableWidget(0, 4)
         self.subtitle_table.setHorizontalHeaderLabels(["开始", "结束", "样式", "文本"])
@@ -963,7 +1058,7 @@ class MainWindow(QMainWindow):
         self.subtitle_table.itemSelectionChanged.connect(self.on_subtitle_selection_changed)
         self.subtitle_table.cellDoubleClicked.connect(self.seek_to_subtitle_row)
         self.subtitle_table.horizontalHeader().setStretchLastSection(True)
-        side_layout.addWidget(self.subtitle_table, 1)
+        subtitle_layout.addWidget(self.subtitle_table, 1)
 
         time_edit_layout = QHBoxLayout()
         time_edit_layout.addWidget(QLabel("开始"))
@@ -981,13 +1076,13 @@ class MainWindow(QMainWindow):
         self.subtitle_end_spin.setSingleStep(0.1)
         self.subtitle_end_spin.setSuffix(" 秒")
         time_edit_layout.addWidget(self.subtitle_end_spin)
-        side_layout.addLayout(time_edit_layout)
+        subtitle_layout.addLayout(time_edit_layout)
 
         self.subtitle_text_edit = QPlainTextEdit()
         self.subtitle_text_edit.setPlaceholderText("输入字幕文本")
         self.subtitle_text_edit.setMaximumHeight(120)
         self.subtitle_text_edit.textChanged.connect(self.update_expert_controls_state)
-        side_layout.addWidget(self.subtitle_text_edit)
+        subtitle_layout.addWidget(self.subtitle_text_edit)
 
         subtitle_button_layout = QHBoxLayout()
         self.add_subtitle_button = QPushButton("加字幕")
@@ -1005,11 +1100,32 @@ class MainWindow(QMainWindow):
         self.clear_subtitles_button = QPushButton("清空")
         self.clear_subtitles_button.clicked.connect(self.clear_subtitles)
         subtitle_button_layout.addWidget(self.clear_subtitles_button)
-        side_layout.addLayout(subtitle_button_layout)
+        subtitle_layout.addLayout(subtitle_button_layout)
+
+        source_audio_layout = QHBoxLayout()
+        self.source_audio_check = QCheckBox("源音")
+        self.source_audio_check.setChecked(True)
+        self.source_audio_check.toggled.connect(self.on_source_audio_toggled)
+        source_audio_layout.addWidget(self.source_audio_check)
+        source_audio_layout.addStretch()
+        self.add_audio_track_button = QPushButton("添加音频")
+        self.add_audio_track_button.clicked.connect(self.add_audio_track)
+        source_audio_layout.addWidget(self.add_audio_track_button)
+        audio_layout.addLayout(source_audio_layout)
+
+        self.audio_tracks_list = QListWidget()
+        self.audio_tracks_list.setMaximumHeight(120)
+        audio_layout.addWidget(self.audio_tracks_list)
+
+        self.audio_track_controls_layout = QVBoxLayout()
+        self.audio_track_controls_layout.setSpacing(8)
+        audio_layout.addLayout(self.audio_track_controls_layout)
+        audio_layout.addStretch()
 
         self.refresh_style_combo()
         self.refresh_expert_delete_ranges_list()
         self.refresh_subtitle_table()
+        self.refresh_audio_controls()
         return page
 
     def apply_mode_button_styles(self):
@@ -1076,6 +1192,8 @@ class MainWindow(QMainWindow):
             "expert_delete_ranges": list(self.expert_delete_ranges),
             "expert_selection": self.expert_selection,
             "expert_output_resolution": self.expert_output_resolution,
+            "source_audio_muted": self.source_audio_muted,
+            "audio_tracks": list(self.audio_tracks),
             "subtitle_project": self.subtitle_project,
             "subtitle_row": subtitle_row,
         }
@@ -1094,10 +1212,10 @@ class MainWindow(QMainWindow):
 
     def update_undo_action_state(self):
         if hasattr(self, "undo_action"):
-            self.undo_action.setEnabled(bool(self._undo_stack) and self.process_thread is None)
+            self.undo_action.setEnabled(bool(self._undo_stack) and self.process_thread is None and self.transcribe_thread is None)
 
     def undo_last_operation(self):
-        if self.process_thread is not None or not self._undo_stack:
+        if self.process_thread is not None or self.transcribe_thread is not None or not self._undo_stack:
             return
 
         state = self._undo_stack.pop()
@@ -1107,11 +1225,14 @@ class MainWindow(QMainWindow):
             self.expert_delete_ranges = list(state["expert_delete_ranges"])
             self.expert_selection = state["expert_selection"]
             self.expert_output_resolution = state["expert_output_resolution"]
+            self.source_audio_muted = bool(state.get("source_audio_muted", False))
+            self.audio_tracks = list(state.get("audio_tracks", []))
             self.subtitle_project = state["subtitle_project"].normalized()
             self._subtitle_timing_dirty = False
 
             self.refresh_delete_ranges_list()
             self.refresh_expert_delete_ranges_list()
+            self.refresh_audio_controls()
             self.refresh_style_combo()
             self.refresh_subtitle_table()
             self.timeline_widget.set_selection(self.expert_selection)
@@ -1185,6 +1306,9 @@ class MainWindow(QMainWindow):
         self.expert_video_size = (1920, 1080)
         self.expert_native_video_size = (1920, 1080)
         self.expert_output_resolution = None
+        self.current_video_has_audio = True
+        self.source_audio_muted = False
+        self.audio_tracks = []
         self._subtitle_timing_dirty = False
         self.clear_undo_stack()
         self._syncing_resolution_controls = True
@@ -1203,6 +1327,7 @@ class MainWindow(QMainWindow):
         self.load_style_controls(self.current_style_name())
         self.refresh_expert_delete_ranges_list()
         self.refresh_subtitle_table()
+        self.refresh_audio_controls()
         self.expert_preview_stack.setCurrentWidget(self.expert_preview_empty)
         self.expert_current_label.setText("0:00")
         self.expert_duration_label.setText("0:00")
@@ -1229,6 +1354,7 @@ class MainWindow(QMainWindow):
         self.expert_native_video_size = (width, height)
         self.expert_fps = float(video_info.get("fps", 30) or 30)
         self.expert_duration_seconds = max(0.0, float(video_info.get("duration", 0) or 0))
+        self.current_video_has_audio = bool(video_info.get("has_audio", True))
 
         preset_name = self.current_style_name()
         if preset_name not in STYLE_PRESET_LABELS:
@@ -1242,6 +1368,7 @@ class MainWindow(QMainWindow):
         self.timeline_widget.set_selection(self.expert_selection)
         self.timeline_widget.set_delete_ranges(self.expert_delete_ranges)
         self.timeline_widget.set_subtitle_cues(self.subtitle_project.cues)
+        self.refresh_audio_controls()
 
         if MULTIMEDIA_AVAILABLE:
             self.ensure_expert_player()
@@ -1608,7 +1735,7 @@ class MainWindow(QMainWindow):
     def update_expert_delete_range_buttons(self):
         has_selection = self.expert_delete_ranges_list.currentRow() >= 0
         has_ranges = bool(self.expert_delete_ranges)
-        enabled = self.current_file is not None and self.process_thread is None
+        enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
         self.remove_expert_range_button.setEnabled(enabled and has_selection)
         self.clear_expert_ranges_button.setEnabled(enabled and has_ranges)
 
@@ -1719,7 +1846,7 @@ class MainWindow(QMainWindow):
         self.update_subtitle_buttons()
 
     def update_subtitle_buttons(self):
-        enabled = self.current_file is not None and self.process_thread is None
+        enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
         row = self.current_subtitle_row()
         has_selection = row >= 0
         has_entries = bool(self.subtitle_project.cues)
@@ -1728,6 +1855,132 @@ class MainWindow(QMainWindow):
         self.remove_subtitle_button.setEnabled(enabled and has_selection)
         self.clear_subtitles_button.setEnabled(enabled and has_entries)
         self.apply_preset_button.setEnabled(enabled)
+        self.recognize_subtitle_button.setEnabled(enabled and self.ffmpeg_path is not None and self.has_transcribable_audio())
+
+    def has_transcribable_audio(self):
+        if self.current_file is None:
+            return False
+        source_enabled = bool(self.current_video_has_audio and not self.source_audio_muted)
+        return source_enabled or any(track.volume > 0 for track in self.audio_tracks)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            widget = item.widget()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
+            if widget is not None:
+                widget.deleteLater()
+
+    def refresh_audio_controls(self):
+        if not hasattr(self, "audio_tracks_list"):
+            return
+
+        self._syncing_audio_controls = True
+        self.source_audio_check.setChecked(bool(self.current_video_has_audio and not self.source_audio_muted))
+        self._syncing_audio_controls = False
+
+        self.audio_tracks_list.clear()
+        for index, track in enumerate(self.audio_tracks, start=1):
+            self.audio_tracks_list.addItem(f"{index}. {Path(track.path).name}  {int(track.volume * 100)}%")
+
+        self._clear_layout(self.audio_track_controls_layout)
+        self.audio_track_volume_spins = []
+        self.audio_track_remove_buttons = []
+        for index, track in enumerate(self.audio_tracks):
+            row = QHBoxLayout()
+            name_label = QLabel(Path(track.path).name)
+            name_label.setToolTip(track.path)
+            row.addWidget(name_label, 1)
+
+            volume_spin = QDoubleSpinBox()
+            volume_spin.setRange(0.0, 2.0)
+            volume_spin.setDecimals(2)
+            volume_spin.setSingleStep(0.05)
+            volume_spin.setValue(track.volume)
+            volume_spin.editingFinished.connect(
+                lambda spin=volume_spin, row_index=index: self.update_audio_track_volume(row_index, spin.value())
+            )
+            row.addWidget(volume_spin)
+            self.audio_track_volume_spins.append(volume_spin)
+
+            remove_button = QPushButton("删除")
+            remove_button.clicked.connect(lambda _checked=False, row_index=index: self.remove_audio_track(row_index))
+            row.addWidget(remove_button)
+            self.audio_track_remove_buttons.append(remove_button)
+            self.audio_track_controls_layout.addLayout(row)
+
+        self.update_audio_buttons()
+
+    def update_audio_buttons(self):
+        if not hasattr(self, "source_audio_check"):
+            return
+        enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
+        self.source_audio_check.setEnabled(enabled and self.current_video_has_audio)
+        self.add_audio_track_button.setEnabled(enabled and len(self.audio_tracks) < 2)
+        self.audio_tracks_list.setEnabled(enabled)
+        for spin in getattr(self, "audio_track_volume_spins", []):
+            spin.setEnabled(enabled)
+        for button in getattr(self, "audio_track_remove_buttons", []):
+            button.setEnabled(enabled)
+
+    def on_source_audio_toggled(self, checked):
+        if self._syncing_audio_controls:
+            return
+        self.push_undo_state()
+        self.source_audio_muted = not bool(checked)
+        self.update_audio_buttons()
+        self.update_subtitle_buttons()
+        self.status_label.setText("源音已开启" if checked else "源音已静音")
+
+    def add_audio_track(self):
+        if len(self.audio_tracks) >= 2:
+            QMessageBox.information(self, "音轨已满", "最多添加 2 条音频。")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "添加音频",
+            "",
+            "音频文件 (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.wma);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            QMessageBox.warning(self, "文件无效", "选择的音频文件不存在。")
+            return
+        if path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            QMessageBox.warning(self, "格式不支持", "请选择常见音频文件，例如 MP3、WAV、M4A。")
+            return
+
+        self.push_undo_state()
+        self.audio_tracks.append(AudioTrack(str(path), 1.0))
+        self.refresh_audio_controls()
+        self.update_expert_controls_state()
+        self.status_label.setText(f"已添加音频，共 {len(self.audio_tracks)} 条")
+
+    def update_audio_track_volume(self, index, value):
+        if self._syncing_audio_controls or index < 0 or index >= len(self.audio_tracks):
+            return
+        track = self.audio_tracks[index]
+        if abs(float(track.volume) - float(value)) < 0.001:
+            return
+        self.push_undo_state()
+        self.audio_tracks[index] = AudioTrack(track.path, value)
+        self.refresh_audio_controls()
+        self.update_expert_controls_state()
+
+    def remove_audio_track(self, index):
+        if index < 0 or index >= len(self.audio_tracks):
+            return
+        self.push_undo_state()
+        del self.audio_tracks[index]
+        self.refresh_audio_controls()
+        self.update_expert_controls_state()
+        self.status_label.setText(f"已删除音频，剩余 {len(self.audio_tracks)} 条")
 
     def add_expert_subtitle(self):
         text = self.subtitle_text_edit.toPlainText()
@@ -1926,11 +2179,79 @@ class MainWindow(QMainWindow):
         self.replace_subtitle_project(project)
         self.status_label.setText(f"已导入字幕 {len(project.cues)} 条")
 
+    def build_transcription_plan_from_controls(self):
+        try:
+            return EditPlan(
+                source_audio_muted=self.source_audio_muted,
+                audio_tracks=tuple(self.audio_tracks),
+                has_audio=self.current_video_has_audio,
+            ).validate()
+        except PlanValidationError as exc:
+            QMessageBox.warning(self, "识别参数无效", str(exc))
+            return None
+
+    def start_subtitle_transcription(self):
+        if self.current_file is None:
+            QMessageBox.information(self, "请先选择视频", "请先打开一个视频。")
+            return
+        if self.ffmpeg_path is None:
+            QMessageBox.warning(self, "未找到 FFmpeg", "请先将 ffmpeg.exe 和 ffprobe.exe 放到软件目录，或安装到系统 PATH。")
+            return
+        if self.transcribe_thread is not None or self.process_thread is not None:
+            return
+        if not self.has_transcribable_audio():
+            QMessageBox.information(self, "没有可识别音频", "请开启源音，或添加一条音频。")
+            return
+        if self.subtitle_project.cues and not self.confirm_clear("替换字幕", "识别结果会替换当前字幕，确定继续吗？"):
+            return
+
+        edit_plan = self.build_transcription_plan_from_controls()
+        if edit_plan is None:
+            return
+
+        self.transcribe_thread = SubtitleTranscribeThread(
+            self.ffmpeg_path,
+            str(self.current_file),
+            edit_plan,
+            self.expert_video_size,
+            self.expert_duration_seconds or None,
+            bilingual=self.bilingual_subtitle_check.isChecked(),
+            parent=self,
+        )
+        self.transcribe_thread.progress_updated.connect(self.progress_bar.setValue)
+        self.transcribe_thread.status_changed.connect(self.status_label.setText)
+        self.transcribe_thread.finished_success.connect(self.on_transcription_success)
+        self.transcribe_thread.finished_error.connect(self.on_transcription_error)
+        self.progress_bar.setValue(0)
+        self.set_processing_state(True)
+        self.status_label.setText("字幕识别已开始...")
+        self.transcribe_thread.start()
+
+    def on_transcription_success(self, project):
+        self.cleanup_transcribe_thread()
+        self.set_processing_state(False)
+        self.progress_bar.setValue(100)
+        self.push_undo_state()
+        self.replace_subtitle_project(project)
+        if project.cues:
+            self.select_subtitle_row(0)
+        self.status_label.setText(f"已识别字幕 {len(project.cues)} 条")
+
+    def on_transcription_error(self, message):
+        self.cleanup_transcribe_thread()
+        self.set_processing_state(False)
+        if message == "字幕识别已取消。":
+            self.progress_bar.setValue(0)
+            self.status_label.setText(message)
+            return
+        self.status_label.setText(message)
+        QMessageBox.warning(self, "字幕识别失败", message)
+
     def update_expert_controls_state(self):
-        enabled = self.current_file is not None and self.process_thread is None
+        enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
         preview_enabled = enabled and self.media_player is not None
 
-        self.expert_open_file_button.setEnabled(self.process_thread is None)
+        self.expert_open_file_button.setEnabled(self.process_thread is None and self.transcribe_thread is None)
         self.expert_play_button.setEnabled(preview_enabled)
         self.expert_position_slider.setEnabled(preview_enabled)
         self.timeline_widget.setEnabled(enabled)
@@ -1951,17 +2272,19 @@ class MainWindow(QMainWindow):
         self.expert_res_combo.setEnabled(enabled)
         self.update_expert_delete_range_buttons()
         self.update_subtitle_buttons()
+        self.update_audio_buttons()
 
     def update_processing_buttons(self):
-        can_start = self.current_file is not None and self.ffmpeg_path is not None and self.process_thread is None
+        busy = self.process_thread is not None or self.transcribe_thread is not None
+        can_start = self.current_file is not None and self.ffmpeg_path is not None and not busy
         self.start_button_simple.setEnabled(can_start)
         self.start_button_expert.setEnabled(can_start)
-        self.cancel_button_simple.setEnabled(self.process_thread is not None)
-        self.cancel_button_expert.setEnabled(self.process_thread is not None)
+        self.cancel_button_simple.setEnabled(busy)
+        self.cancel_button_expert.setEnabled(busy)
         self.update_undo_action_state()
 
     def update_delete_range_controls(self, enabled):
-        processing = self.process_thread is not None
+        processing = self.process_thread is not None or self.transcribe_thread is not None
         active = enabled and not processing
         self.delete_start_spin.setEnabled(active)
         self.delete_end_spin.setEnabled(active)
@@ -2013,7 +2336,7 @@ class MainWindow(QMainWindow):
         self.update_delete_range_buttons()
 
     def update_delete_range_buttons(self):
-        enabled = self.delete_range_check.isChecked() and self.process_thread is None
+        enabled = self.delete_range_check.isChecked() and self.process_thread is None and self.transcribe_thread is None
         has_ranges = bool(self.delete_ranges)
         has_selection = self.delete_ranges_list.currentRow() >= 0
         self.remove_delete_range_button.setEnabled(enabled and has_selection)
@@ -2064,6 +2387,8 @@ class MainWindow(QMainWindow):
                 delete_ranges=tuple(DeleteRange(start, end) for start, end in self.expert_delete_ranges),
                 output=OutputOptions(resolution=self.expert_output_resolution),
                 subtitles=self.subtitle_project,
+                source_audio_muted=self.source_audio_muted,
+                audio_tracks=tuple(self.audio_tracks),
             ).validate()
         except (PlanValidationError, SubtitleValidationError) as exc:
             QMessageBox.warning(self, "编辑参数无效", str(exc))
@@ -2076,6 +2401,8 @@ class MainWindow(QMainWindow):
         self.start_processing(self.build_expert_edit_plan_from_controls())
 
     def start_processing(self, edit_plan):
+        if self.process_thread is not None or self.transcribe_thread is not None:
+            return
         if self.current_file is None:
             QMessageBox.information(self, "请选择文件", "请先选择一个视频文件。")
             return
@@ -2100,6 +2427,9 @@ class MainWindow(QMainWindow):
         if self.process_thread is not None:
             self.status_label.setText("正在取消处理...")
             self.process_thread.stop()
+        if self.transcribe_thread is not None:
+            self.status_label.setText("正在取消字幕识别...")
+            self.transcribe_thread.stop()
 
     def on_process_success(self, output_path):
         self.cleanup_thread()
@@ -2139,11 +2469,20 @@ class MainWindow(QMainWindow):
         self.process_thread = None
         self.update_processing_buttons()
 
+    def cleanup_transcribe_thread(self):
+        if self.transcribe_thread is None:
+            return
+        self.transcribe_thread.wait(3000)
+        self.transcribe_thread.deleteLater()
+        self.transcribe_thread = None
+        self.update_processing_buttons()
+
     def check_ffmpeg(self):
         self.ffmpeg_path = find_ffmpeg()
         self.ffprobe_path = find_ffprobe(self.ffmpeg_path)
         self.status_label.setText("准备就绪" if self.ffmpeg_path else "未检测到 FFmpeg，暂时无法开始处理")
         self.update_processing_buttons()
+        self.update_expert_controls_state()
 
     def start_thumbnail_generation(self, path):
         if self.ffmpeg_path is None:
@@ -2176,14 +2515,14 @@ class MainWindow(QMainWindow):
             return
 
         self.drop_area.set_thumbnail(pixmap)
-        if self.process_thread is None:
+        if self.process_thread is None and self.transcribe_thread is None:
             self.status_label.setText("文件已加载，可以开始处理")
 
     def on_thumbnail_failed(self, video_path, message):
         if self.current_file is None or str(self.current_file) != str(Path(video_path)):
             return
         self.drop_area.clear_thumbnail("预览生成失败\n点击或拖入其他视频可重新选择")
-        if self.process_thread is None:
+        if self.process_thread is None and self.transcribe_thread is None:
             self.status_label.setText(f"{message}，仍可处理")
 
     def cleanup_thumbnail_thread(self, thread):
@@ -2210,6 +2549,9 @@ class MainWindow(QMainWindow):
         if self.process_thread is not None:
             self.process_thread.stop()
             self.process_thread.wait(3000)
+        if self.transcribe_thread is not None:
+            self.transcribe_thread.stop()
+            self.transcribe_thread.wait(3000)
         for thread in list(self.thumbnail_threads):
             thread.stop()
             thread.wait(3000)

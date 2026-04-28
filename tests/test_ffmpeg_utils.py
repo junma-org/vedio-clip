@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from ffmpeg_utils import (
+    build_audio_mixdown_command,
     build_ffmpeg_command,
     build_ffmpeg_command_from_plan,
     build_ffmpeg_progress_command,
@@ -11,7 +12,7 @@ from ffmpeg_utils import (
     prepare_subtitle_file_for_plan,
     _parse_progress_time_seconds,
 )
-from edit_model import DeleteRange, EditPlan, OutputOptions
+from edit_model import AudioTrack, DeleteRange, EditPlan, OutputOptions, PlanValidationError
 from subtitle_model import SubtitleEntry, SubtitleStyle, SubtitleTrack
 
 
@@ -137,6 +138,86 @@ class FfmpegUtilsTest(unittest.TestCase):
         self.assertIn("subtitle.ass", filter_text)
         self.assertIn("select='gte(t,5)'", filter_text)
         self.assertNotIn("-ss", cmd)
+
+    def test_build_command_mutes_source_audio(self):
+        plan = EditPlan(has_audio=True, source_audio_muted=True)
+
+        cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan)
+
+        self.assertIn("-an", cmd)
+        self.assertNotIn("-c:a", cmd)
+
+    def test_build_command_mixes_source_and_external_audio(self):
+        plan = EditPlan(
+            delete_ranges=(DeleteRange(10, 12),),
+            audio_tracks=(AudioTrack("voice.mp3", 0.75), AudioTrack("music.mp3", 0.25)),
+        )
+
+        cmd = build_ffmpeg_command_from_plan(
+            "ffmpeg",
+            "input.mp4",
+            "output.mp4",
+            plan,
+            output_duration=30,
+        )
+
+        self.assertEqual(cmd[:8], ["ffmpeg", "-y", "-i", "input.mp4", "-i", "voice.mp3", "-i", "music.mp3"])
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:a:0]aselect='not(between(t,10,12))',asetpts=N/SR/TB[a0]", filter_complex)
+        self.assertIn("[1:a:0]aselect='not(between(t,10,12))',asetpts=N/SR/TB,volume=0.75[a1]", filter_complex)
+        self.assertIn("[2:a:0]aselect='not(between(t,10,12))',asetpts=N/SR/TB,volume=0.25[a2]", filter_complex)
+        self.assertIn("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0", filter_complex)
+        self.assertIn("atrim=0:30,asetpts=N/SR/TB[aout]", filter_complex)
+        self.assertIn("-map", cmd)
+        self.assertIn("[aout]", cmd)
+
+    def test_build_command_uses_external_audio_when_source_is_muted(self):
+        plan = EditPlan(
+            has_audio=True,
+            source_audio_muted=True,
+            audio_tracks=(AudioTrack("voice.mp3", 1.2),),
+        )
+
+        cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan, output_duration=20)
+
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertNotIn("[0:a:0]", filter_complex)
+        self.assertIn("[1:a:0]volume=1.2[a0]", filter_complex)
+        self.assertIn("[a0]atrim=0:20,asetpts=N/SR/TB[aout]", filter_complex)
+
+    def test_build_command_ignores_zero_volume_external_audio(self):
+        plan = EditPlan(
+            has_audio=False,
+            source_audio_muted=True,
+            audio_tracks=(AudioTrack("voice.mp3", 0),),
+        )
+
+        cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan)
+
+        self.assertNotIn("voice.mp3", cmd)
+        self.assertIn("-an", cmd)
+
+    def test_build_audio_mixdown_command_uses_source_timebase(self):
+        plan = EditPlan(
+            delete_ranges=(DeleteRange(10, 20),),
+            source_audio_muted=True,
+            audio_tracks=(AudioTrack("voice.mp3", 0.8),),
+        )
+
+        cmd = build_audio_mixdown_command("ffmpeg", "input.mp4", "speech.wav", plan, duration=60)
+
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[1:a:0]volume=0.8[a0]", filter_complex)
+        self.assertNotIn("between(t,10,20)", filter_complex)
+        self.assertIn("-t", cmd)
+        self.assertIn("60", cmd)
+        self.assertEqual(cmd[-8:], ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "speech.wav"])
+
+    def test_build_audio_mixdown_command_rejects_no_audio(self):
+        plan = EditPlan(has_audio=False, source_audio_muted=True)
+
+        with self.assertRaises(PlanValidationError):
+            build_audio_mixdown_command("ffmpeg", "input.mp4", "speech.wav", plan)
 
     def test_prepare_subtitle_file_for_plan_writes_ass(self):
         plan = EditPlan(subtitles=SubtitleTrack(entries=(SubtitleEntry(1, 2, "字幕"),)))

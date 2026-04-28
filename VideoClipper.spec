@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from PyInstaller.building.build_main import Analysis, PYZ, EXE
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 block_cipher = None
 # build_spec.bat 会先切到项目目录，因此这里直接使用当前工作目录。
@@ -21,11 +22,23 @@ def optional_data_dir(dirname):
         return []
     return [(str(data_path), dirname)]
 
+whisper_datas = (
+    collect_data_files('faster_whisper')
+    + copy_metadata('faster-whisper')
+    + copy_metadata('ctranslate2')
+    + copy_metadata('av')
+)
+whisper_hiddenimports = (
+    collect_submodules('faster_whisper')
+    + collect_submodules('ctranslate2')
+    + collect_submodules('av')
+)
+
 a = Analysis(
     ['main.py'],
     pathex=[str(project_dir)],
     binaries=required_binary('ffmpeg.exe') + required_binary('ffprobe.exe'),
-    datas=optional_data_dir('fonts'),
+    datas=optional_data_dir('fonts') + whisper_datas,
     hiddenimports=[
         'PySide6.QtCore',
         'PySide6.QtGui',
@@ -34,11 +47,12 @@ a = Analysis(
         'PySide6.QtMultimediaWidgets',
         'gui',
         'ffmpeg_utils',
+        'whisper_utils',
         'pysubs2',
         'subtitle_model',
         'timeline_state',
         'timeline_widget',
-    ],
+    ] + whisper_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

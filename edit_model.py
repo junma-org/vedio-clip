@@ -13,6 +13,9 @@ class PlanValidationError(ValueError):
     """编辑计划参数不合法。"""
 
 
+MAX_AUDIO_TRACKS = 2
+
+
 def _as_float(value, field_name):
     try:
         number = float(value)
@@ -137,12 +140,31 @@ class OutputOptions:
 
 
 @dataclass(frozen=True)
+class AudioTrack:
+    path: str
+    volume: float = 1.0
+
+    def validate(self):
+        path = str(self.path or "").strip()
+        if not path:
+            raise PlanValidationError("音频文件不能为空。")
+
+        volume = _as_float(self.volume, "音轨音量")
+        if volume < 0 or volume > 2:
+            raise PlanValidationError("音轨音量必须在 0 到 2 之间。")
+
+        return AudioTrack(path=path, volume=volume)
+
+
+@dataclass(frozen=True)
 class EditPlan:
     skip_seconds: float = 0
     delete_ranges: Tuple[DeleteRange, ...] = field(default_factory=tuple)
     output: OutputOptions = field(default_factory=OutputOptions)
     subtitles: SubtitleProject = field(default_factory=SubtitleProject)
     has_audio: bool = True
+    source_audio_muted: bool = False
+    audio_tracks: Tuple[AudioTrack, ...] = field(default_factory=tuple)
 
     def normalized(self, total_duration=None):
         skip_seconds = _validate_seconds(self.skip_seconds, "剪掉开头秒数")
@@ -156,12 +178,18 @@ class EditPlan:
         except SubtitleValidationError as exc:
             raise PlanValidationError(str(exc))
 
+        audio_tracks = tuple(self._coerce_audio_track(item).validate() for item in (self.audio_tracks or ()))
+        if len(audio_tracks) > MAX_AUDIO_TRACKS:
+            raise PlanValidationError(f"最多只能添加 {MAX_AUDIO_TRACKS} 条音频。")
+
         return EditPlan(
             skip_seconds=skip_seconds,
             delete_ranges=tuple(DeleteRange(start, end) for start, end in normalized_ranges),
             output=self.output.normalized(),
             subtitles=subtitles,
             has_audio=bool(self.has_audio),
+            source_audio_muted=bool(self.source_audio_muted),
+            audio_tracks=audio_tracks,
         )
 
     def validate(self, total_duration=None):
@@ -189,6 +217,13 @@ class EditPlan:
     def with_has_audio(self, has_audio):
         return replace(self, has_audio=bool(has_audio))
 
+    def source_audio_enabled(self):
+        return bool(self.has_audio and not self.source_audio_muted)
+
+    def has_output_audio(self):
+        plan = self.normalized()
+        return bool(plan.source_audio_enabled() or any(track.volume > 0 for track in plan.audio_tracks))
+
     def delete_range_tuples(self):
         return [item.as_tuple() for item in self.delete_ranges]
 
@@ -203,3 +238,17 @@ class EditPlan:
             raise PlanValidationError("删除区间必须包含开始秒数和结束秒数。")
 
         return DeleteRange(start, end)
+
+    @staticmethod
+    def _coerce_audio_track(item):
+        if isinstance(item, AudioTrack):
+            return item
+        if isinstance(item, dict):
+            return AudioTrack(item.get("path", ""), item.get("volume", 1.0))
+
+        try:
+            path, volume = item
+        except (TypeError, ValueError):
+            raise PlanValidationError("音轨必须包含文件路径和音量。")
+
+        return AudioTrack(path, volume)

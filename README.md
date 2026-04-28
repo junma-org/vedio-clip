@@ -15,6 +15,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **删除区间**: 可添加多个指定秒数区间，例如删除 10-20 秒、80-100 秒
 - **达人编辑台**: 自动最大化、视频预览、时间轴拖选、删除选区、删除当前帧
 - **ASS 字幕链路**: 支持 ASS/SRT 导入、剪贴板导入、字幕列表编辑、实时预览和硬字幕烧录
+- **语音识别字幕**: 集成 faster-whisper medium，支持从源音/外部音频识别字幕，默认原文 + 英文双语
+- **外部音频混音**: 达人模式最多添加 2 条音频，可独立调整音量，并可单独静音源视频音频
 - **分辨率选择**: 支持多种常用分辨率
 - **视频预览**: 选中文件后显示第一帧，方便确认内容
 - **自动打开目录**: 处理完成后自动打开导出文件所在目录
@@ -28,6 +30,8 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - **Delete Ranges**: Add multiple time ranges to remove, such as 10-20s and 80-100s
 - **Expert Mode MVP**: Preview video, seek to a timestamp, set in/out points, and add delete ranges
 - **Basic Subtitles**: Add manual subtitles, import SRT files, and burn subtitles into exported video
+- **Speech-to-Subtitles**: Use faster-whisper medium to recognize subtitles from source audio or added audio, with original + English bilingual output by default
+- **Audio Mixing**: Add up to 2 external audio tracks in Expert Mode, adjust each volume, and mute source video audio independently
 - **Resolution Options**: Support for multiple common resolutions
 - **Video Preview**: Show the first frame after selecting a file
 - **Open Output Folder**: Automatically open the output folder after processing
@@ -41,12 +45,14 @@ A simple and user-friendly video clipping tool for Windows beginners.
 - Windows 7/10/11
 - 无需安装 Python（使用打包版）
 - 打包版已内置 FFmpeg
+- 首次识别字幕会下载 faster-whisper medium 模型到软件同级 `models/faster-whisper-medium`
 
 ---
 
 - Windows 7/10/11
 - No Python installation required (for packaged version)
 - FFmpeg is bundled in packaged releases
+- The first subtitle recognition downloads the faster-whisper medium model to `models/faster-whisper-medium` next to the app
 
 ---
 
@@ -112,9 +118,19 @@ If running from source, place `ffmpeg.exe` and `ffprobe.exe` in the project fold
 
 ---
 
+## 字幕识别模型 | Subtitle Recognition Model
+
+faster-whisper medium 模型不会默认塞入单文件 EXE。第一次点击“识别”时，软件会自动下载模型到 `models/faster-whisper-medium`；之后可离线复用。
+
+The faster-whisper medium model is not embedded in the single EXE by default. On the first "Recognize" action, the app downloads it to `models/faster-whisper-medium`; later runs reuse it offline.
+
+---
+
 ## 支持的格式 | Supported Formats
 
 **输入格式 | Input Formats:** MP4, AVI, MKV, MOV, FLV, WMV, WEBM, M4V
+
+**音频格式 | Audio Formats:** MP3, WAV, M4A, AAC, FLAC, OGG, WMA
 
 **输出格式 | Output Format:** MP4 (H.264 编码，兼容性最佳 | H.264 encoded, best compatibility)
 
@@ -128,6 +144,7 @@ video-clipper/
 ├── gui.py           # PySide6 界面 | PySide6 GUI
 ├── edit_model.py    # 统一编辑模型 | Unified edit model
 ├── subtitle_model.py # 字幕工程模型与 ASS/SRT 读写 | Subtitle project model and ASS/SRT I/O
+├── whisper_utils.py # faster-whisper 识别与字幕转换 | faster-whisper transcription
 ├── timeline_state.py # 时间轴纯逻辑 | Timeline logic
 ├── timeline_widget.py # 达人模式时间轴控件 | Expert timeline widget
 ├── ffmpeg_utils.py  # FFmpeg 工具函数 | FFmpeg utilities
@@ -149,6 +166,7 @@ video-clipper/
 - PySide6 (GUI 框架 | GUI framework)
 - FFmpeg (视频处理 | Video processing)
 - pysubs2 (字幕读写与 ASS/SRT 转换 | Subtitle parsing and ASS/SRT conversion)
+- faster-whisper (语音识别字幕 | Speech-to-subtitles)
 - PyInstaller (打包工具 | Packaging tool)
 
 ---

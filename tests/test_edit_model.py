@@ -1,6 +1,7 @@
 import unittest
 
 from edit_model import (
+    AudioTrack,
     DeleteRange,
     EditPlan,
     OutputOptions,
@@ -52,6 +53,35 @@ class EditModelTest(unittest.TestCase):
         plan = EditPlan().with_has_audio(False).validate()
 
         self.assertFalse(plan.has_audio)
+
+    def test_edit_plan_supports_source_audio_mute_and_tracks(self):
+        plan = EditPlan(
+            has_audio=True,
+            source_audio_muted=True,
+            audio_tracks=(AudioTrack("voice.mp3", "0.75"),),
+        ).validate()
+
+        self.assertFalse(plan.source_audio_enabled())
+        self.assertTrue(plan.has_output_audio())
+        self.assertEqual(plan.audio_tracks[0].volume, 0.75)
+
+    def test_edit_plan_rejects_too_many_audio_tracks(self):
+        plan = EditPlan(
+            audio_tracks=(
+                AudioTrack("a.mp3"),
+                AudioTrack("b.mp3"),
+                AudioTrack("c.mp3"),
+            )
+        )
+
+        with self.assertRaises(PlanValidationError):
+            plan.validate()
+
+    def test_edit_plan_rejects_invalid_audio_volume(self):
+        plan = EditPlan(audio_tracks=(AudioTrack("voice.mp3", 2.5),))
+
+        with self.assertRaises(PlanValidationError):
+            plan.validate()
 
     def test_edit_plan_normalizes_subtitles(self):
         plan = EditPlan(
