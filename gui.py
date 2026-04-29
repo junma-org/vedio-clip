@@ -6,9 +6,10 @@ import sys
 import os
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QThread, QTimer, Qt, QRectF, QUrl, Signal
+from PySide6.QtCore import QItemSelectionModel, QPointF, QThread, QTimer, Qt, QRectF, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -32,6 +33,7 @@ except ImportError:
     QGraphicsVideoItem = None
     MULTIMEDIA_AVAILABLE = False
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QColorDialog,
@@ -84,6 +86,7 @@ from subtitle_model import (
     extract_fade_from_tags,
     load_subtitle_file,
     load_subtitle_text,
+    serialize_srt_entries,
     set_fade_on_tags,
 )
 from timeline_state import (
@@ -582,7 +585,25 @@ class SubtitleOverlayItem(QGraphicsObject):
             style = style_map.get(cue.style_name, self._project.style)
             self._draw_cue(painter, cue, style, scale)
 
+    def _cue_opacity(self, cue):
+        fade = extract_fade_from_tags(cue.raw_tags)
+        if not fade:
+            return 1.0
+
+        fade_in_ms, fade_out_ms = fade
+        opacity = 1.0
+        elapsed_ms = max(0.0, (self._current_time - cue.start) * 1000)
+        remaining_ms = max(0.0, (cue.end - self._current_time) * 1000)
+        if fade_in_ms > 0 and elapsed_ms < fade_in_ms:
+            opacity = min(opacity, elapsed_ms / fade_in_ms)
+        if fade_out_ms > 0 and remaining_ms < fade_out_ms:
+            opacity = min(opacity, remaining_ms / fade_out_ms)
+        return max(0.0, min(1.0, opacity))
+
     def _draw_cue(self, painter, cue, style, scale):
+        painter.save()
+        painter.setOpacity(painter.opacity() * self._cue_opacity(cue))
+
         font = QFont(style.font_name, max(12, int(round(style.font_size * scale))))
         font.setBold(bool(style.bold))
         font.setItalic(bool(style.italic))
@@ -624,6 +645,7 @@ class SubtitleOverlayItem(QGraphicsObject):
 
         painter.setPen(QPen(primary, 1))
         painter.drawText(draw_rect, flags, cue.text)
+        painter.restore()
 
 
 class MainWindow(QMainWindow):
@@ -663,6 +685,7 @@ class MainWindow(QMainWindow):
         self.subtitle_overlay_item = None
         self._syncing_expert_position = False
         self._syncing_style_controls = False
+        self._syncing_subtitle_editor = False
         self._syncing_resolution_controls = False
         self._syncing_audio_controls = False
         self._subtitle_timing_dirty = False
@@ -995,9 +1018,6 @@ class MainWindow(QMainWindow):
         self.subtitle_style_combo = QComboBox()
         self.subtitle_style_combo.currentIndexChanged.connect(self.on_subtitle_style_changed)
         style_layout.addWidget(self.subtitle_style_combo, 1)
-        self.apply_preset_button = QPushButton("应用")
-        self.apply_preset_button.clicked.connect(self.apply_selected_style)
-        style_layout.addWidget(self.apply_preset_button)
         subtitle_layout.addLayout(style_layout)
 
         style_edit_layout = QHBoxLayout()
@@ -1008,11 +1028,13 @@ class MainWindow(QMainWindow):
             self.subtitle_font_combo.addItem(family)
         if self.subtitle_font_combo.lineEdit() is not None:
             self.subtitle_font_combo.lineEdit().setPlaceholderText("选择或输入字体")
+        self.subtitle_font_combo.currentTextChanged.connect(self.on_subtitle_style_controls_changed)
         style_edit_layout.addWidget(self.subtitle_font_combo, 1)
         style_edit_layout.addWidget(QLabel("字号"))
         self.subtitle_font_size_spin = QSpinBox()
         self.subtitle_font_size_spin.setRange(12, 160)
         self.subtitle_font_size_spin.setValue(44)
+        self.subtitle_font_size_spin.valueChanged.connect(self.on_subtitle_style_controls_changed)
         style_edit_layout.addWidget(self.subtitle_font_size_spin)
         subtitle_layout.addLayout(style_edit_layout)
 
@@ -1022,13 +1044,14 @@ class MainWindow(QMainWindow):
         self.subtitle_color_button.clicked.connect(self.choose_subtitle_color)
         color_effect_layout.addWidget(self.subtitle_color_button)
         self.subtitle_fade_check = QCheckBox("渐隐渐显")
-        self.subtitle_fade_check.toggled.connect(lambda _checked: self.update_expert_controls_state())
+        self.subtitle_fade_check.toggled.connect(self.on_subtitle_effect_controls_changed)
         color_effect_layout.addWidget(self.subtitle_fade_check)
         self.subtitle_fade_ms_spin = QSpinBox()
         self.subtitle_fade_ms_spin.setRange(50, 3000)
         self.subtitle_fade_ms_spin.setSingleStep(50)
         self.subtitle_fade_ms_spin.setValue(200)
         self.subtitle_fade_ms_spin.setSuffix(" ms")
+        self.subtitle_fade_ms_spin.valueChanged.connect(self.on_subtitle_effect_controls_changed)
         color_effect_layout.addWidget(self.subtitle_fade_ms_spin)
         subtitle_layout.addLayout(color_effect_layout)
 
@@ -1054,10 +1077,12 @@ class MainWindow(QMainWindow):
         self.subtitle_table.setHorizontalHeaderLabels(["开始", "结束", "样式", "文本"])
         self.subtitle_table.verticalHeader().setVisible(False)
         self.subtitle_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.subtitle_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.subtitle_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.subtitle_table.itemSelectionChanged.connect(self.on_subtitle_selection_changed)
         self.subtitle_table.cellDoubleClicked.connect(self.seek_to_subtitle_row)
         self.subtitle_table.horizontalHeader().setStretchLastSection(True)
+        self.install_subtitle_table_actions()
         subtitle_layout.addWidget(self.subtitle_table, 1)
 
         time_edit_layout = QHBoxLayout()
@@ -1067,6 +1092,7 @@ class MainWindow(QMainWindow):
         self.subtitle_start_spin.setDecimals(2)
         self.subtitle_start_spin.setSingleStep(0.1)
         self.subtitle_start_spin.setSuffix(" 秒")
+        self.subtitle_start_spin.valueChanged.connect(self.on_subtitle_timing_controls_changed)
         time_edit_layout.addWidget(self.subtitle_start_spin)
 
         time_edit_layout.addWidget(QLabel("结束"))
@@ -1075,31 +1101,21 @@ class MainWindow(QMainWindow):
         self.subtitle_end_spin.setDecimals(2)
         self.subtitle_end_spin.setSingleStep(0.1)
         self.subtitle_end_spin.setSuffix(" 秒")
+        self.subtitle_end_spin.valueChanged.connect(self.on_subtitle_timing_controls_changed)
         time_edit_layout.addWidget(self.subtitle_end_spin)
         subtitle_layout.addLayout(time_edit_layout)
 
         self.subtitle_text_edit = QPlainTextEdit()
         self.subtitle_text_edit.setPlaceholderText("输入字幕文本")
         self.subtitle_text_edit.setMaximumHeight(120)
-        self.subtitle_text_edit.textChanged.connect(self.update_expert_controls_state)
+        self.subtitle_text_edit.textChanged.connect(self.on_subtitle_text_changed)
         subtitle_layout.addWidget(self.subtitle_text_edit)
 
         subtitle_button_layout = QHBoxLayout()
         self.add_subtitle_button = QPushButton("加字幕")
         self.add_subtitle_button.clicked.connect(self.add_expert_subtitle)
         subtitle_button_layout.addWidget(self.add_subtitle_button)
-
-        self.update_subtitle_button = QPushButton("更新")
-        self.update_subtitle_button.clicked.connect(self.update_selected_subtitle)
-        subtitle_button_layout.addWidget(self.update_subtitle_button)
-
-        self.remove_subtitle_button = QPushButton("删除")
-        self.remove_subtitle_button.clicked.connect(self.remove_selected_subtitle)
-        subtitle_button_layout.addWidget(self.remove_subtitle_button)
-
-        self.clear_subtitles_button = QPushButton("清空")
-        self.clear_subtitles_button.clicked.connect(self.clear_subtitles)
-        subtitle_button_layout.addWidget(self.clear_subtitles_button)
+        subtitle_button_layout.addStretch()
         subtitle_layout.addLayout(subtitle_button_layout)
 
         source_audio_layout = QHBoxLayout()
@@ -1175,6 +1191,25 @@ class MainWindow(QMainWindow):
     def copy_developer_wechat(self):
         QApplication.clipboard().setText(DEVELOPER_WECHAT)
         self.status_label.setText(f"已复制微信号: {DEVELOPER_WECHAT}")
+
+    def install_subtitle_table_actions(self):
+        self.select_all_subtitles_action = QAction(self.subtitle_table)
+        self.select_all_subtitles_action.setShortcut(QKeySequence.SelectAll)
+        self.select_all_subtitles_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.select_all_subtitles_action.triggered.connect(self.subtitle_table.selectAll)
+        self.subtitle_table.addAction(self.select_all_subtitles_action)
+
+        self.copy_subtitles_action = QAction(self.subtitle_table)
+        self.copy_subtitles_action.setShortcut(QKeySequence.Copy)
+        self.copy_subtitles_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.copy_subtitles_action.triggered.connect(self.copy_selected_subtitles_as_srt)
+        self.subtitle_table.addAction(self.copy_subtitles_action)
+
+        self.delete_subtitles_action = QAction(self.subtitle_table)
+        self.delete_subtitles_action.setShortcut(QKeySequence("Del"))
+        self.delete_subtitles_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.delete_subtitles_action.triggered.connect(self.remove_selected_subtitles)
+        self.subtitle_table.addAction(self.delete_subtitles_action)
 
     def confirm_clear(self, title, message):
         return QMessageBox.question(self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
@@ -1551,6 +1586,9 @@ class MainWindow(QMainWindow):
     def on_timeline_selection_changed(self, start, end):
         self.expert_selection = TimelineSelection(start, end)
         self.timeline_widget.set_selection(self.expert_selection)
+        if self._subtitle_timing_dirty and self.current_subtitle_row() >= 0 and self.expert_selection.is_range:
+            self.apply_current_subtitle_from_editor(status="已更新字幕时间", reload_editor=False)
+            self._subtitle_timing_dirty = False
         self.update_expert_controls_state()
 
     def on_subtitle_timing_previewed(self, row, start, end, _playhead):
@@ -1560,10 +1598,14 @@ class MainWindow(QMainWindow):
             self.subtitle_table.selectRow(row)
         self._subtitle_timing_dirty = True
         self.expert_selection = TimelineSelection(start, end)
-        self.subtitle_start_spin.setValue(start)
-        self.subtitle_end_spin.setValue(end)
+        self._syncing_subtitle_editor = True
+        try:
+            self.subtitle_start_spin.setValue(start)
+            self.subtitle_end_spin.setValue(end)
+        finally:
+            self._syncing_subtitle_editor = False
         self.timeline_widget.set_selection(self.expert_selection)
-        self.status_label.setText("已预览字幕时间调整，点击“更新”确认修改")
+        self.status_label.setText("已预览字幕时间调整，松开后自动应用")
         self.update_expert_controls_state()
 
     def refresh_style_combo(self):
@@ -1628,14 +1670,38 @@ class MainWindow(QMainWindow):
         self._syncing_style_controls = False
 
     def on_subtitle_style_changed(self):
-        if self._syncing_style_controls:
+        if self._syncing_style_controls or self._syncing_subtitle_editor:
             return
         self.load_style_controls(self.current_style_name())
+        self.apply_subtitle_style_controls_to_selection("已应用字幕模板")
+
+    def on_subtitle_style_controls_changed(self, *_args):
+        if self._syncing_style_controls or self._syncing_subtitle_editor:
+            return
+        self.apply_subtitle_style_controls_to_selection("已更新字幕样式")
+
+    def on_subtitle_effect_controls_changed(self, *_args):
+        if self._syncing_style_controls or self._syncing_subtitle_editor:
+            return
+        self.update_expert_controls_state()
+        self.apply_subtitle_effect_controls_to_selection()
+
+    def on_subtitle_text_changed(self):
+        if self._syncing_subtitle_editor:
+            return
+        self.update_expert_controls_state()
+        self.apply_current_subtitle_from_editor(status="已更新字幕文本", reload_editor=False)
+
+    def on_subtitle_timing_controls_changed(self, *_args):
+        if self._syncing_subtitle_editor:
+            return
+        self.apply_current_subtitle_from_editor(status="已更新字幕时间", reload_editor=False)
 
     def choose_subtitle_color(self):
         color = QColorDialog.getColor(self._subtitle_color, self, "选择字幕颜色")
         if color.isValid():
             self.set_subtitle_color_button(color)
+            self.apply_subtitle_style_controls_to_selection("已更新字幕颜色")
 
     def style_from_controls(self, style_name):
         base = self.style_for_name(style_name)
@@ -1665,19 +1731,30 @@ class MainWindow(QMainWindow):
             encoding=base.encoding,
         ).normalized()
 
-    def apply_style_controls_to_project(self, project, style_name):
+    def unique_subtitle_style_name(self, project, base_name):
         base = project.normalized()
-        style = self.style_from_controls(style_name)
+        existing_names = {style.name for style in base.styles}
+        stem = str(base_name or DEFAULT_STYLE_PRESET).strip() or DEFAULT_STYLE_PRESET
+        counter = 1
+        while True:
+            candidate = f"{stem}_custom_{counter}"
+            if candidate not in existing_names:
+                return candidate
+            counter += 1
+
+    def with_style_in_project(self, project, style):
+        base = project.normalized()
+        target = style.normalized()
         styles = []
         replaced = False
         for existing in base.styles:
-            if existing.name == style.name:
-                styles.append(style)
+            if existing.name == target.name:
+                styles.append(target)
                 replaced = True
             else:
                 styles.append(existing)
         if not replaced:
-            styles.append(style)
+            styles.append(target)
         return SubtitleProject(
             cues=base.cues,
             styles=tuple(styles),
@@ -1687,6 +1764,25 @@ class MainWindow(QMainWindow):
             play_res_y=base.play_res_y,
             default_style_name=base.default_style_name,
         ).normalized()
+
+    def scoped_style_for_rows(self, project, style, rows):
+        base = project.normalized()
+        target = style.normalized()
+        row_set = set(rows or ())
+        if not row_set:
+            return target
+
+        style_map = base.style_map()
+        existing = style_map.get(target.name)
+        used_outside_selection = any(
+            cue.style_name == target.name for index, cue in enumerate(base.cues) if index not in row_set
+        )
+        if existing is not None and existing != target and used_outside_selection:
+            return replace(target, name=self.unique_subtitle_style_name(base, target.name)).normalized()
+        return target
+
+    def apply_style_controls_to_project(self, project, style_name):
+        return self.with_style_in_project(project, self.style_from_controls(style_name))
 
     def raw_tags_from_effect_controls(self, original_raw_tags=""):
         if self.subtitle_fade_check.isChecked():
@@ -1714,6 +1810,143 @@ class MainWindow(QMainWindow):
             play_res_y=base.play_res_y,
             default_style_name=base.default_style_name,
         ).normalized()
+
+    def subtitle_project_with_cues(self, project, cues):
+        base = project.normalized()
+        return SubtitleProject(
+            cues=tuple(cues),
+            styles=base.styles,
+            script_info=base.script_info,
+            enabled=base.enabled,
+            play_res_x=base.play_res_x,
+            play_res_y=base.play_res_y,
+            default_style_name=base.default_style_name,
+        ).normalized()
+
+    def set_subtitle_project_after_edit(self, project, selected_rows=None, status=None, reload_editor=True, refresh_styles=True):
+        updated = project.normalized()
+        if updated == self.subtitle_project.normalized():
+            return False
+
+        rows = self.selected_subtitle_rows() if selected_rows is None else list(selected_rows)
+        focus_widget = QApplication.focusWidget()
+        self.push_undo_state()
+        self._syncing_subtitle_editor = True
+        try:
+            self.subtitle_project = updated
+            if refresh_styles:
+                self.refresh_style_combo()
+            self.refresh_subtitle_table()
+            self.restore_subtitle_selection(rows)
+            if self.subtitle_overlay_item is not None:
+                self.subtitle_overlay_item.set_project(self.subtitle_project)
+                self.subtitle_overlay_item.set_current_time(self.current_expert_seconds())
+            self.update_expert_controls_state()
+        finally:
+            self._syncing_subtitle_editor = False
+
+        if reload_editor:
+            self.on_subtitle_selection_changed()
+            if focus_widget is not None:
+                focus_widget.setFocus()
+        elif focus_widget is not None:
+            focus_widget.setFocus()
+
+        if status:
+            self.status_label.setText(status)
+        return True
+
+    def apply_subtitle_style_controls_to_selection(self, status):
+        style_name = self.current_style_name()
+        rows = self.selected_subtitle_rows()
+        target_style = self.scoped_style_for_rows(self.subtitle_project, self.style_from_controls(style_name), rows)
+        project = self.with_style_in_project(self.subtitle_project, target_style)
+        style_name = target_style.name
+
+        if rows:
+            cues = list(project.cues)
+            for row in rows:
+                cue = cues[row]
+                cues[row] = SubtitleCue(
+                    start=cue.start,
+                    end=cue.end,
+                    text=cue.text,
+                    style_name=style_name,
+                    source_kind=cue.source_kind,
+                    raw_tags=cue.raw_tags,
+                    raw_text="",
+                    layer=cue.layer,
+                )
+            project = self.subtitle_project_with_cues(project, cues)
+
+        label = status if rows else f"已准备模板: {self.subtitle_style_combo.currentText()}"
+        self.set_subtitle_project_after_edit(project, rows, label, reload_editor=bool(rows), refresh_styles=True)
+
+    def apply_subtitle_effect_controls_to_selection(self):
+        rows = self.selected_subtitle_rows()
+        if not rows:
+            return
+
+        cues = list(self.subtitle_project.cues)
+        for row in rows:
+            cue = cues[row]
+            cues[row] = SubtitleCue(
+                start=cue.start,
+                end=cue.end,
+                text=cue.text,
+                style_name=cue.style_name,
+                source_kind=cue.source_kind,
+                raw_tags=self.raw_tags_from_effect_controls(cue.raw_tags),
+                raw_text="",
+                layer=cue.layer,
+            )
+        project = self.subtitle_project_with_cues(self.subtitle_project, cues)
+        self.set_subtitle_project_after_edit(project, rows, f"已更新 {len(rows)} 条字幕效果", reload_editor=False, refresh_styles=False)
+
+    def apply_current_subtitle_from_editor(self, status, reload_editor):
+        rows = self.selected_subtitle_rows()
+        if len(rows) != 1:
+            return False
+
+        row = rows[0]
+        if row < 0 or row >= len(self.subtitle_project.cues):
+            return False
+
+        text = self.subtitle_text_edit.toPlainText()
+        start = self.subtitle_start_spin.value()
+        end = self.subtitle_end_spin.value()
+        if not text.strip() or end <= start:
+            return False
+
+        original = self.subtitle_project.cues[row]
+        try:
+            cue = SubtitleCue(
+                start=start,
+                end=end,
+                text=text,
+                style_name=original.style_name,
+                source_kind=original.source_kind,
+                raw_tags=original.raw_tags,
+                raw_text="",
+                layer=original.layer,
+            ).normalized()
+        except SubtitleValidationError:
+            return False
+
+        if cue == original:
+            return False
+
+        cues = list(self.subtitle_project.cues)
+        cues[row] = cue
+        project = self.subtitle_project_with_cues(self.subtitle_project, cues)
+        selected_row = project.cues.index(cue) if cue in project.cues else row
+        return self.set_subtitle_project_after_edit(
+            project,
+            [selected_row],
+            status,
+            reload_editor=reload_editor,
+            refresh_styles=False,
+        )
 
     def replace_subtitle_project(self, project):
         self.subtitle_project = project.normalized()
@@ -1798,17 +2031,39 @@ class MainWindow(QMainWindow):
         cues = self.subtitle_project.cues
         self.subtitle_table.setRowCount(len(cues))
         for row, cue in enumerate(cues):
-            self.subtitle_table.setItem(row, 0, QTableWidgetItem(f"{cue.start:.2f}"))
-            self.subtitle_table.setItem(row, 1, QTableWidgetItem(f"{cue.end:.2f}"))
-            self.subtitle_table.setItem(row, 2, QTableWidgetItem(cue.style_name))
-            preview = cue.text.replace("\n", " / ")
-            self.subtitle_table.setItem(row, 3, QTableWidgetItem(preview))
+            self.update_subtitle_table_row(row, cue)
         self.timeline_widget.set_subtitle_cues(cues)
         self.update_subtitle_buttons()
 
+    def update_subtitle_table_row(self, row, cue):
+        self.subtitle_table.setItem(row, 0, QTableWidgetItem(f"{cue.start:.2f}"))
+        self.subtitle_table.setItem(row, 1, QTableWidgetItem(f"{cue.end:.2f}"))
+        self.subtitle_table.setItem(row, 2, QTableWidgetItem(cue.style_name))
+        self.subtitle_table.setItem(row, 3, QTableWidgetItem(cue.text.replace("\n", " / ")))
+
+    def selected_subtitle_rows(self):
+        if not hasattr(self, "subtitle_table") or self.subtitle_table.selectionModel() is None:
+            return []
+        rows = sorted({index.row() for index in self.subtitle_table.selectionModel().selectedRows()})
+        return [row for row in rows if 0 <= row < len(self.subtitle_project.cues)]
+
     def current_subtitle_row(self):
-        selection = self.subtitle_table.selectionModel().selectedRows()
-        return selection[0].row() if selection else -1
+        rows = self.selected_subtitle_rows()
+        current = self.subtitle_table.currentRow()
+        if current in rows:
+            return current
+        return rows[0] if rows else -1
+
+    def restore_subtitle_selection(self, rows):
+        rows = [row for row in rows if 0 <= row < len(self.subtitle_project.cues)]
+        self.subtitle_table.clearSelection()
+        if not rows:
+            return
+        selection_model = self.subtitle_table.selectionModel()
+        for row in rows:
+            index = self.subtitle_table.model().index(row, 0)
+            selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        self.subtitle_table.setCurrentCell(rows[0], 0)
 
     def select_subtitle_row(self, row):
         if row < 0 or row >= len(self.subtitle_project.cues):
@@ -1822,39 +2077,48 @@ class MainWindow(QMainWindow):
             self.seek_expert_seconds(self.subtitle_project.cues[row].start)
 
     def on_subtitle_selection_changed(self):
+        if self._syncing_subtitle_editor:
+            return
+
         row = self.current_subtitle_row()
         self.timeline_widget.set_selected_subtitle_index(row)
         if row < 0 or row >= len(self.subtitle_project.cues):
-            self.subtitle_start_spin.setValue(0)
-            self.subtitle_end_spin.setValue(0)
-            self.load_effect_controls(None)
+            self._syncing_subtitle_editor = True
+            try:
+                self.subtitle_start_spin.setValue(0)
+                self.subtitle_end_spin.setValue(0)
+                self.subtitle_text_edit.clear()
+                self.load_effect_controls(None)
+            finally:
+                self._syncing_subtitle_editor = False
             self.update_subtitle_buttons()
             return
 
         cue = self.subtitle_project.cues[row]
         self._subtitle_timing_dirty = False
-        self.subtitle_start_spin.setValue(cue.start)
-        self.subtitle_end_spin.setValue(cue.end)
-        self.subtitle_text_edit.setPlainText(cue.text)
-        combo_index = self.subtitle_style_combo.findData(cue.style_name)
-        if combo_index >= 0:
-            self.subtitle_style_combo.setCurrentIndex(combo_index)
-        self.load_style_controls(cue.style_name)
-        self.load_effect_controls(cue)
+        self._syncing_subtitle_editor = True
+        try:
+            self.subtitle_start_spin.setValue(cue.start)
+            self.subtitle_end_spin.setValue(cue.end)
+            self.subtitle_text_edit.setPlainText(cue.text)
+            combo_index = self.subtitle_style_combo.findData(cue.style_name)
+            if combo_index >= 0:
+                self.subtitle_style_combo.setCurrentIndex(combo_index)
+            self.load_style_controls(cue.style_name)
+            self.load_effect_controls(cue)
+        finally:
+            self._syncing_subtitle_editor = False
         self.expert_selection = TimelineSelection(cue.start, cue.end)
         self.timeline_widget.set_selection(self.expert_selection)
         self.update_subtitle_buttons()
 
     def update_subtitle_buttons(self):
         enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
-        row = self.current_subtitle_row()
-        has_selection = row >= 0
-        has_entries = bool(self.subtitle_project.cues)
-        self.update_subtitle_button.setText("更新*" if self._subtitle_timing_dirty else "更新")
-        self.update_subtitle_button.setEnabled(enabled and has_selection)
-        self.remove_subtitle_button.setEnabled(enabled and has_selection)
-        self.clear_subtitles_button.setEnabled(enabled and has_entries)
-        self.apply_preset_button.setEnabled(enabled)
+        has_selection = bool(self.selected_subtitle_rows())
+        if hasattr(self, "copy_subtitles_action"):
+            self.copy_subtitles_action.setEnabled(has_selection)
+        if hasattr(self, "delete_subtitles_action"):
+            self.delete_subtitles_action.setEnabled(enabled and has_selection)
         self.recognize_subtitle_button.setEnabled(enabled and self.ffmpeg_path is not None and self.has_transcribable_audio())
 
     def has_transcribable_audio(self):
@@ -2017,54 +2281,12 @@ class MainWindow(QMainWindow):
         self.select_subtitle_row(row)
         self.status_label.setText(f"已添加字幕，共 {len(project.cues)} 条")
 
-    def update_selected_subtitle(self):
-        row = self.current_subtitle_row()
-        if row < 0 or row >= len(self.subtitle_project.cues):
+    def remove_selected_subtitles(self):
+        rows = set(self.selected_subtitle_rows())
+        if not rows:
             return
 
-        style_name = self.current_style_name()
-        project = self.ensure_style_exists(style_name)
-        project = self.apply_style_controls_to_project(project, style_name)
-        original = project.cues[row]
-        try:
-            cue = SubtitleCue(
-                start=self.subtitle_start_spin.value(),
-                end=self.subtitle_end_spin.value(),
-                text=self.subtitle_text_edit.toPlainText(),
-                style_name=style_name,
-                source_kind=original.source_kind,
-                raw_tags=self.raw_tags_from_effect_controls(original.raw_tags),
-                raw_text="",
-                layer=original.layer,
-            ).normalized()
-        except SubtitleValidationError as exc:
-            QMessageBox.warning(self, "更新字幕失败", str(exc))
-            return
-
-        cues = list(project.cues)
-        cues[row] = cue
-        updated = SubtitleProject(
-            cues=tuple(cues),
-            styles=project.styles,
-            script_info=project.script_info,
-            enabled=project.enabled,
-            play_res_x=project.play_res_x,
-            play_res_y=project.play_res_y,
-            default_style_name=project.default_style_name,
-        ).normalized()
-        self.push_undo_state()
-        self.replace_subtitle_project(updated)
-        self.select_subtitle_row(row)
-        self._subtitle_timing_dirty = False
-        self.status_label.setText("已更新字幕")
-
-    def remove_selected_subtitle(self):
-        row = self.current_subtitle_row()
-        if row < 0 or row >= len(self.subtitle_project.cues):
-            return
-
-        cues = list(self.subtitle_project.cues)
-        del cues[row]
+        cues = [cue for index, cue in enumerate(self.subtitle_project.cues) if index not in rows]
         project = SubtitleProject(
             cues=tuple(cues),
             styles=self.subtitle_project.styles,
@@ -2075,65 +2297,19 @@ class MainWindow(QMainWindow):
             default_style_name=self.subtitle_project.default_style_name,
         ).normalized()
         self.push_undo_state()
+        next_row = min(rows)
         self.replace_subtitle_project(project)
+        if project.cues:
+            self.select_subtitle_row(min(next_row, len(project.cues) - 1))
         self.status_label.setText(f"已删除字幕，剩余 {len(project.cues)} 条")
 
-    def clear_subtitles(self):
-        if not self.subtitle_project.cues:
+    def copy_selected_subtitles_as_srt(self):
+        rows = self.selected_subtitle_rows()
+        if not rows:
             return
-        if not self.confirm_clear("清空字幕", f"确定清空全部 {len(self.subtitle_project.cues)} 条字幕吗？"):
-            return
-
-        project = SubtitleProject(
-            cues=tuple(),
-            styles=self.subtitle_project.styles,
-            script_info=self.subtitle_project.script_info,
-            enabled=True,
-            play_res_x=self.subtitle_project.play_res_x,
-            play_res_y=self.subtitle_project.play_res_y,
-            default_style_name=self.subtitle_project.default_style_name,
-        ).normalized()
-        self.push_undo_state()
-        self.replace_subtitle_project(project)
-        self.subtitle_text_edit.clear()
-        self.status_label.setText("已清空字幕")
-
-    def apply_selected_style(self):
-        style_name = self.current_style_name()
-        project = self.ensure_style_exists(style_name)
-        project = self.apply_style_controls_to_project(project, style_name)
-        row = self.current_subtitle_row()
-        if row < 0 or row >= len(project.cues):
-            self.push_undo_state()
-            self.replace_subtitle_project(project)
-            self.status_label.setText(f"已准备模板: {self.subtitle_style_combo.currentText()}")
-            return
-
-        cue = project.cues[row]
-        cues = list(project.cues)
-        cues[row] = SubtitleCue(
-            start=cue.start,
-            end=cue.end,
-            text=cue.text,
-            style_name=style_name,
-            source_kind=cue.source_kind,
-            raw_tags=self.raw_tags_from_effect_controls(cue.raw_tags),
-            raw_text="",
-            layer=cue.layer,
-        )
-        updated = SubtitleProject(
-            cues=tuple(cues),
-            styles=project.styles,
-            script_info=project.script_info,
-            enabled=project.enabled,
-            play_res_x=project.play_res_x,
-            play_res_y=project.play_res_y,
-            default_style_name=project.default_style_name,
-        ).normalized()
-        self.push_undo_state()
-        self.replace_subtitle_project(updated)
-        self.select_subtitle_row(row)
-        self.status_label.setText("已应用字幕模板")
+        cues = [self.subtitle_project.cues[row] for row in rows]
+        QApplication.clipboard().setText(serialize_srt_entries(cues))
+        self.status_label.setText(f"已复制 {len(cues)} 条字幕为 SRT 文本")
 
     def import_subtitle_file(self):
         if self.current_file is None:
@@ -2259,10 +2435,13 @@ class MainWindow(QMainWindow):
         self.delete_frame_button.setEnabled(enabled and self.expert_duration_seconds > 0)
         self.import_subtitle_button.setEnabled(enabled)
         self.import_clipboard_button.setEnabled(enabled)
-        self.subtitle_text_edit.setEnabled(enabled)
-        self.subtitle_start_spin.setEnabled(enabled)
-        self.subtitle_end_spin.setEnabled(enabled)
-        self.add_subtitle_button.setEnabled(enabled and bool(self.subtitle_text_edit.toPlainText().strip()))
+        subtitle_rows = self.selected_subtitle_rows() if hasattr(self, "subtitle_table") else []
+        single_or_none = len(subtitle_rows) <= 1
+        self.subtitle_table.setEnabled(enabled)
+        self.subtitle_text_edit.setEnabled(enabled and single_or_none)
+        self.subtitle_start_spin.setEnabled(enabled and single_or_none)
+        self.subtitle_end_spin.setEnabled(enabled and single_or_none)
+        self.add_subtitle_button.setEnabled(enabled and single_or_none and bool(self.subtitle_text_edit.toPlainText().strip()))
         self.subtitle_style_combo.setEnabled(enabled)
         self.subtitle_font_combo.setEnabled(enabled)
         self.subtitle_font_size_spin.setEnabled(enabled)

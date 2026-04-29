@@ -651,7 +651,7 @@ def build_style_preset(preset_id="short_speech_bottom", video_size=None):
         "short_speech_bottom": SubtitleStyleDef(
             name="short_speech_bottom",
             font_name="Microsoft YaHei",
-            font_size=max(30, int(round(44 * scale))),
+            font_size=max(30, int(round(40 * scale))),
             primary_color="&H00FFFFFF",
             outline_color="&H00000000",
             back_color="&H64000000",
@@ -661,7 +661,7 @@ def build_style_preset(preset_id="short_speech_bottom", video_size=None):
             alignment=2,
             margin_l=max(40, int(round(width * 0.04))),
             margin_r=max(40, int(round(width * 0.04))),
-            margin_v=max(40, int(round(height * 0.37))),
+            margin_v=max(40, int(round(height * 0.29))),
         ),
         "center_emphasis": SubtitleStyleDef(
             name="center_emphasis",
