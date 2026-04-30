@@ -14,6 +14,8 @@ class PlanValidationError(ValueError):
 
 
 MAX_AUDIO_TRACKS = 2
+MAX_MEDIA_OVERLAYS = 8
+OVERLAY_MEDIA_KINDS = {"image", "video"}
 
 
 def _as_float(value, field_name):
@@ -157,6 +159,78 @@ class AudioTrack:
 
 
 @dataclass(frozen=True)
+class OverlayClip:
+    path: str
+    media_kind: str = "image"
+    start: float = 0
+    end: float = 3
+    source_start: float = 0
+    source_end: Optional[float] = None
+
+    def validate(self):
+        path = str(self.path or "").strip()
+        if not path:
+            raise PlanValidationError("覆盖素材文件不能为空。")
+
+        media_kind = str(self.media_kind or "").strip().lower()
+        if media_kind not in OVERLAY_MEDIA_KINDS:
+            raise PlanValidationError("覆盖素材类型必须是 image 或 video。")
+
+        start = _validate_seconds(self.start, "覆盖素材开始秒数")
+        end = _validate_seconds(self.end, "覆盖素材结束秒数")
+        if end <= start:
+            raise PlanValidationError("覆盖素材结束秒数必须大于开始秒数。")
+
+        if media_kind == "image":
+            return OverlayClip(
+                path=path,
+                media_kind=media_kind,
+                start=start,
+                end=end,
+                source_start=0,
+                source_end=None,
+            )
+
+        source_start = _validate_seconds(self.source_start, "覆盖视频源开始秒数")
+        if self.source_end is None:
+            source_end = source_start + (end - start)
+        else:
+            source_end = _validate_seconds(self.source_end, "覆盖视频源结束秒数")
+        if source_end <= source_start:
+            raise PlanValidationError("覆盖视频源结束秒数必须大于源开始秒数。")
+
+        return OverlayClip(
+            path=path,
+            media_kind=media_kind,
+            start=start,
+            end=end,
+            source_start=source_start,
+            source_end=source_end,
+        )
+
+    @property
+    def duration(self):
+        return max(0, float(self.end) - float(self.start))
+
+    @property
+    def source_duration(self):
+        if self.source_end is None:
+            return self.duration
+        return max(0, float(self.source_end) - float(self.source_start))
+
+    def as_tuple(self):
+        clip = self.validate()
+        return (
+            clip.path,
+            clip.media_kind,
+            clip.start,
+            clip.end,
+            clip.source_start,
+            clip.source_end,
+        )
+
+
+@dataclass(frozen=True)
 class EditPlan:
     skip_seconds: float = 0
     delete_ranges: Tuple[DeleteRange, ...] = field(default_factory=tuple)
@@ -165,6 +239,7 @@ class EditPlan:
     has_audio: bool = True
     source_audio_muted: bool = False
     audio_tracks: Tuple[AudioTrack, ...] = field(default_factory=tuple)
+    media_overlays: Tuple[OverlayClip, ...] = field(default_factory=tuple)
 
     def normalized(self, total_duration=None):
         skip_seconds = _validate_seconds(self.skip_seconds, "剪掉开头秒数")
@@ -182,6 +257,12 @@ class EditPlan:
         if len(audio_tracks) > MAX_AUDIO_TRACKS:
             raise PlanValidationError(f"最多只能添加 {MAX_AUDIO_TRACKS} 条音频。")
 
+        media_overlays = tuple(
+            self._coerce_overlay_clip(item).validate() for item in (self.media_overlays or ())
+        )
+        if len(media_overlays) > MAX_MEDIA_OVERLAYS:
+            raise PlanValidationError(f"最多只能添加 {MAX_MEDIA_OVERLAYS} 个覆盖素材。")
+
         return EditPlan(
             skip_seconds=skip_seconds,
             delete_ranges=tuple(DeleteRange(start, end) for start, end in normalized_ranges),
@@ -190,6 +271,7 @@ class EditPlan:
             has_audio=bool(self.has_audio),
             source_audio_muted=bool(self.source_audio_muted),
             audio_tracks=audio_tracks,
+            media_overlays=media_overlays,
         )
 
     def validate(self, total_duration=None):
@@ -227,6 +309,9 @@ class EditPlan:
     def delete_range_tuples(self):
         return [item.as_tuple() for item in self.delete_ranges]
 
+    def overlay_clip_tuples(self):
+        return [item.as_tuple() for item in self.media_overlays]
+
     @staticmethod
     def _coerce_delete_range(item):
         if isinstance(item, DeleteRange):
@@ -252,3 +337,34 @@ class EditPlan:
             raise PlanValidationError("音轨必须包含文件路径和音量。")
 
         return AudioTrack(path, volume)
+
+    @staticmethod
+    def _coerce_overlay_clip(item):
+        if isinstance(item, OverlayClip):
+            return item
+        if isinstance(item, dict):
+            return OverlayClip(
+                path=item.get("path", ""),
+                media_kind=item.get("media_kind", item.get("kind", "image")),
+                start=item.get("start", 0),
+                end=item.get("end", 3),
+                source_start=item.get("source_start", 0),
+                source_end=item.get("source_end"),
+            )
+
+        try:
+            values = list(item)
+        except TypeError:
+            raise PlanValidationError("覆盖素材必须包含路径、类型、开始秒数和结束秒数。")
+        if len(values) == 4:
+            path, media_kind, start, end = values
+            source_start, source_end = 0, None
+        elif len(values) == 5:
+            path, media_kind, start, end, source_start = values
+            source_end = None
+        elif len(values) == 6:
+            path, media_kind, start, end, source_start, source_end = values
+        else:
+            raise PlanValidationError("覆盖素材必须包含路径、类型、开始秒数和结束秒数。")
+
+        return OverlayClip(path, media_kind, start, end, source_start, source_end)

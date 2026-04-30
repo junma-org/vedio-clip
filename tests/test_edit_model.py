@@ -4,6 +4,7 @@ from edit_model import (
     AudioTrack,
     DeleteRange,
     EditPlan,
+    OverlayClip,
     OutputOptions,
     PlanValidationError,
 )
@@ -79,6 +80,24 @@ class EditModelTest(unittest.TestCase):
 
     def test_edit_plan_rejects_invalid_audio_volume(self):
         plan = EditPlan(audio_tracks=(AudioTrack("voice.mp3", 2.5),))
+
+        with self.assertRaises(PlanValidationError):
+            plan.validate()
+
+    def test_edit_plan_normalizes_media_overlays(self):
+        plan = EditPlan(
+            media_overlays=(
+                OverlayClip("cover.png", "image", "1", "4"),
+                OverlayClip("broll.mp4", "video", 5, 7, 2, None),
+            )
+        ).validate()
+
+        self.assertEqual(plan.media_overlays[0].media_kind, "image")
+        self.assertIsNone(plan.media_overlays[0].source_end)
+        self.assertEqual(plan.media_overlays[1].source_end, 4.0)
+
+    def test_edit_plan_rejects_invalid_media_overlay(self):
+        plan = EditPlan(media_overlays=(OverlayClip("", "audio", 2, 1),))
 
         with self.assertRaises(PlanValidationError):
             plan.validate()

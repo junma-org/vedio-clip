@@ -12,7 +12,7 @@ from ffmpeg_utils import (
     prepare_subtitle_file_for_plan,
     _parse_progress_time_seconds,
 )
-from edit_model import AudioTrack, DeleteRange, EditPlan, OutputOptions, PlanValidationError
+from edit_model import AudioTrack, DeleteRange, EditPlan, OverlayClip, OutputOptions, PlanValidationError
 from subtitle_model import SubtitleEntry, SubtitleStyle, SubtitleTrack
 
 
@@ -196,6 +196,43 @@ class FfmpegUtilsTest(unittest.TestCase):
 
         self.assertNotIn("voice.mp3", cmd)
         self.assertIn("-an", cmd)
+
+    def test_build_command_overlays_image_and_video_materials(self):
+        plan = EditPlan(
+            delete_ranges=(DeleteRange(2, 4),),
+            media_overlays=(
+                OverlayClip("broll.mp4", "video", 5, 7, 1, 3),
+                OverlayClip("cover.png", "image", 8, 10),
+            ),
+            has_audio=False,
+        )
+
+        cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan)
+
+        self.assertEqual(cmd[:11], ["ffmpeg", "-y", "-i", "input.mp4", "-i", "broll.mp4", "-loop", "1", "-t", "2", "-i"])
+        self.assertIn("cover.png", cmd)
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:v:0]select='not(between(t,2,4))',setpts=N/FRAME_RATE/TB[vbase0]", filter_complex)
+        self.assertIn("[1:v:0]trim=start=1:end=3,setpts=PTS-STARTPTS+3/TB,format=rgba", filter_complex)
+        self.assertIn("enable='between(t,3,5)'", filter_complex)
+        self.assertIn("[2:v:0]trim=duration=2,setpts=PTS-STARTPTS+6/TB,format=rgba", filter_complex)
+        self.assertIn("scale2ref=w=main_w:h=main_h", filter_complex)
+        self.assertIn("[vov2]", cmd)
+
+    def test_build_command_offsets_audio_inputs_after_overlay_materials(self):
+        plan = EditPlan(
+            has_audio=False,
+            source_audio_muted=True,
+            media_overlays=(OverlayClip("cover.png", "image", 1, 3),),
+            audio_tracks=(AudioTrack("voice.mp3", 0.8),),
+        )
+
+        cmd = build_ffmpeg_command_from_plan("ffmpeg", "input.mp4", "output.mp4", plan, output_duration=10)
+
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[2:a:0]volume=0.8[a0]", filter_complex)
+        self.assertIn("[a0]atrim=0:10,asetpts=N/SR/TB[aout]", filter_complex)
+        self.assertIn("[aout]", cmd)
 
     def test_build_audio_mixdown_command_uses_source_timebase(self):
         plan = EditPlan(

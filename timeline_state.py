@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from math import isfinite
 
-from edit_model import DeleteRange, normalize_delete_ranges
+from edit_model import DeleteRange, OverlayClip, normalize_delete_ranges
 from subtitle_model import SubtitleCue, SubtitleValidationError
 
 
@@ -23,6 +23,18 @@ def _as_seconds(value, field_name):
     if not isfinite(seconds):
         raise TimelineStateError(f"{field_name}必须是有限数字。")
     return max(0, seconds)
+
+
+def _as_delta_seconds(value, field_name):
+    if value is None:
+        raise TimelineStateError(f"{field_name}不能为空。")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise TimelineStateError(f"{field_name}必须是有效数字。")
+    if not isfinite(seconds):
+        raise TimelineStateError(f"{field_name}必须是有限数字。")
+    return seconds
 
 
 def _clip_to_duration(seconds, total_duration):
@@ -104,6 +116,81 @@ def move_timed_range(start, end, delta, total_duration=None):
             new_start -= shift
             new_end = duration
     return TimelineSelection(max(0, new_start), max(0, new_end)).normalized(total_duration=total_duration)
+
+
+def move_overlay_clip(clip, delta, total_duration=None):
+    current = clip.validate() if isinstance(clip, OverlayClip) else OverlayClip(*clip).validate()
+    offset = _as_delta_seconds(delta, "移动偏移")
+    duration = current.end - current.start
+    new_start = current.start + offset
+    new_end = current.end + offset
+
+    if total_duration is not None:
+        total = _clip_to_duration(_as_seconds(total_duration, "视频时长"), None)
+        if new_start < 0:
+            new_end -= new_start
+            new_start = 0
+        if new_end > total:
+            shift = new_end - total
+            new_start -= shift
+            new_end = total
+
+    new_start = max(0, new_start)
+    new_end = max(new_start + duration, new_end)
+    if total_duration is not None:
+        new_end = min(new_end, _clip_to_duration(_as_seconds(total_duration, "视频时长"), None))
+        new_start = max(0, min(new_start, max(0, new_end - duration)))
+
+    return OverlayClip(
+        path=current.path,
+        media_kind=current.media_kind,
+        start=new_start,
+        end=new_end,
+        source_start=current.source_start,
+        source_end=current.source_end,
+    ).validate()
+
+
+def resize_overlay_clip(clip, edge, seconds, total_duration=None, min_duration=0.1):
+    current = clip.validate() if isinstance(clip, OverlayClip) else OverlayClip(*clip).validate()
+    duration_floor = max(0.001, _as_seconds(min_duration, "最小时长"))
+    target = _clip_to_duration(_as_seconds(seconds, "调整时间"), total_duration)
+
+    start = current.start
+    end = current.end
+    source_start = current.source_start
+    source_end = current.source_end
+
+    if edge == "start":
+        new_start = min(target, current.end - duration_floor)
+        new_start = max(0, new_start)
+        if current.media_kind == "video" and source_end is not None:
+            source_delta = new_start - current.start
+            new_source_start = max(0, source_start + source_delta)
+            max_source_start = max(0, source_end - duration_floor)
+            if new_source_start > max_source_start:
+                new_source_start = max_source_start
+            new_start = current.start + (new_source_start - source_start)
+            source_start = new_source_start
+        start = min(new_start, end - duration_floor)
+    elif edge == "end":
+        new_end = max(target, current.start + duration_floor)
+        if total_duration is not None:
+            new_end = _clip_to_duration(new_end, total_duration)
+        end = max(current.start + duration_floor, new_end)
+        if current.media_kind == "video":
+            source_end = source_start + (end - current.start)
+    else:
+        raise TimelineStateError("只能调整开始或结束边界。")
+
+    return OverlayClip(
+        path=current.path,
+        media_kind=current.media_kind,
+        start=start,
+        end=end,
+        source_start=source_start,
+        source_end=source_end,
+    ).validate()
 
 
 def add_delete_range_from_selection(existing_ranges, selection, total_duration=None):

@@ -183,3 +183,6 @@ $RECYCLE.BIN/
 *.exe
 *.zip
 *.tar.gz
+
+# Local build fonts
+/fonts/*.ttf

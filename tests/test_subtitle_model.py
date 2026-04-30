@@ -8,6 +8,7 @@ from subtitle_model import (
     add_subtitle_from_marks,
     build_style_preset,
     extract_fade_from_tags,
+    extract_position_from_tags,
     format_srt_timestamp,
     load_ass_text,
     load_subtitle_text,
@@ -15,7 +16,9 @@ from subtitle_model import (
     serialize_ass_project,
     serialize_srt_entries,
     set_fade_on_tags,
+    set_position_on_tags,
     strip_fade_from_tags,
+    strip_position_from_tags,
 )
 
 
@@ -144,6 +147,13 @@ Dialogue: 0,0:00:01.00,0:00:03.00,custom,,0000,0000,0000,,{\\b1}Hello\\NWorld
         self.assertEqual(extract_fade_from_tags(raw_tags), (100, 200))
         self.assertEqual(strip_fade_from_tags(raw_tags), "{\\b1}{\\i1}")
         self.assertEqual(set_fade_on_tags(raw_tags, 250, 300), "{\\fad(250,300)}{\\b1}{\\i1}")
+
+    def test_position_tag_helpers_preserve_other_ass_tags(self):
+        raw_tags = "{\\pos(100,200)\\b1}{\\fad(100,200)}"
+
+        self.assertEqual(extract_position_from_tags(raw_tags), (100.0, 200.0))
+        self.assertEqual(strip_position_from_tags(raw_tags), "{\\b1}{\\fad(100,200)}")
+        self.assertEqual(set_position_on_tags(raw_tags, 120.5, 220), "{\\pos(120.5,220)}{\\b1}{\\fad(100,200)}")
 
 
 if __name__ == "__main__":

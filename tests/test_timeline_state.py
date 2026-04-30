@@ -1,5 +1,6 @@
 import unittest
 
+from edit_model import OverlayClip
 from subtitle_model import SubtitleValidationError
 from timeline_state import (
     TimelineSelection,
@@ -7,7 +8,9 @@ from timeline_state import (
     add_delete_range_from_selection,
     add_subtitle_from_selection_or_playhead,
     delete_current_frame,
+    move_overlay_clip,
     move_timed_range,
+    resize_overlay_clip,
     resize_timed_range,
     selection_from_points,
 )
@@ -103,6 +106,28 @@ class TimelineStateTest(unittest.TestCase):
 
         selection = move_timed_range(1, 3, -5, total_duration=10)
         self.assertEqual(selection, TimelineSelection(0.0, 2.0))
+
+    def test_move_overlay_clip_clamps_to_duration(self):
+        clip = move_overlay_clip(OverlayClip("cover.png", "image", 8, 10), 4, total_duration=10)
+
+        self.assertEqual((clip.start, clip.end), (8.0, 10.0))
+
+    def test_resize_video_overlay_start_trims_source_start(self):
+        clip = resize_overlay_clip(
+            OverlayClip("broll.mp4", "video", 5, 9, 1, 5),
+            "start",
+            6,
+            total_duration=12,
+        )
+
+        self.assertEqual((clip.start, clip.end), (6.0, 9.0))
+        self.assertEqual((clip.source_start, clip.source_end), (2.0, 5.0))
+
+    def test_resize_image_overlay_end_changes_duration(self):
+        clip = resize_overlay_clip(OverlayClip("cover.png", "image", 2, 4), "end", 6, total_duration=10)
+
+        self.assertEqual((clip.start, clip.end), (2.0, 6.0))
+        self.assertIsNone(clip.source_end)
 
 
 if __name__ == "__main__":

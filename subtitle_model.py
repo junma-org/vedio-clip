@@ -26,6 +26,9 @@ _ASS_TAG_RE = re.compile(r"\{[^}]*\}")
 _ASS_LEADING_TAG_RE = re.compile(r"^(?P<tags>(?:\{[^}]*\})+)")
 _ASS_TAG_BODY_RE = re.compile(r"\{(?P<body>[^}]*)\}")
 _ASS_FADE_COMMAND_RE = re.compile(r"\\fad\s*\(\s*(?P<in>\d+)\s*,\s*(?P<out>\d+)\s*\)")
+_ASS_POSITION_COMMAND_RE = re.compile(
+    r"\\pos\s*\(\s*(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)\s*\)"
+)
 _ASS_TIME_RE = re.compile(r"^\d+:\d{2}:\d{2}\.\d{2}$")
 
 _ASS_STYLE_FIELDS = [
@@ -232,6 +235,40 @@ def strip_fade_from_tags(raw_tags):
         if body:
             cleaned_tags.append(f"{{{body}}}")
     return "".join(cleaned_tags)
+
+
+def extract_position_from_tags(raw_tags):
+    tags = extract_leading_ass_tags(raw_tags)
+    match = _ASS_POSITION_COMMAND_RE.search(tags)
+    if not match:
+        return None
+    return float(match.group("x")), float(match.group("y"))
+
+
+def strip_position_from_tags(raw_tags):
+    tags = extract_leading_ass_tags(raw_tags)
+    if not tags:
+        return ""
+
+    cleaned_tags = []
+    for match in _ASS_TAG_BODY_RE.finditer(tags):
+        body = _ASS_POSITION_COMMAND_RE.sub("", match.group("body"))
+        if body:
+            cleaned_tags.append(f"{{{body}}}")
+    return "".join(cleaned_tags)
+
+
+def _format_ass_position_number(value):
+    number = _as_float(value, "字幕位置")
+    text = f"{number:.2f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def set_position_on_tags(raw_tags, x=None, y=None):
+    tags = strip_position_from_tags(raw_tags)
+    if x is None or y is None:
+        return tags
+    return f"{{\\pos({_format_ass_position_number(x)},{_format_ass_position_number(y)})}}{tags}"
 
 
 def set_fade_on_tags(raw_tags, fade_in_ms=None, fade_out_ms=None):

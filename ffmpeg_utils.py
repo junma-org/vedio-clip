@@ -423,7 +423,13 @@ def _audio_filter_chain(input_label, output_label, keep_expression=None, volume=
     return f"[{input_label}]{','.join(filters)}[{output_label}]"
 
 
-def _build_audio_mix_filter(source_audio_enabled, audio_tracks, keep_expression=None, output_duration=None):
+def _build_audio_mix_filter(
+    source_audio_enabled,
+    audio_tracks,
+    keep_expression=None,
+    output_duration=None,
+    first_audio_input_index=1,
+):
     filter_parts = []
     labels = []
 
@@ -432,7 +438,7 @@ def _build_audio_mix_filter(source_audio_enabled, audio_tracks, keep_expression=
         filter_parts.append(_audio_filter_chain("0:a:0", output_label, keep_expression=keep_expression))
         labels.append(output_label)
 
-    for track_index, track in enumerate(audio_tracks, start=1):
+    for track_index, track in enumerate(audio_tracks, start=first_audio_input_index):
         output_label = f"a{len(labels)}"
         filter_parts.append(
             _audio_filter_chain(
@@ -461,6 +467,109 @@ def _build_audio_mix_filter(source_audio_enabled, audio_tracks, keep_expression=
         filter_parts.append("".join(f"[{label}]" for label in labels) + f"{mix_filter}[aout]")
 
     return ";".join(filter_parts)
+
+
+def _removed_duration_before(seconds, delete_ranges):
+    removed = 0.0
+    for start, end in _normalize_ranges(delete_ranges):
+        if seconds <= start:
+            break
+        removed += max(0.0, min(seconds, end) - start)
+    return removed
+
+
+def _source_time_to_output_time(seconds, delete_ranges):
+    return max(0.0, float(seconds) - _removed_duration_before(float(seconds), delete_ranges))
+
+
+def _kept_segments_for_range(start, end, delete_ranges):
+    cursor = float(start)
+    limit = float(end)
+    segments = []
+    for delete_start, delete_end in _normalize_ranges(delete_ranges):
+        if delete_end <= cursor:
+            continue
+        if delete_start >= limit:
+            break
+        if delete_start > cursor:
+            segments.append((cursor, min(delete_start, limit)))
+        cursor = max(cursor, delete_end)
+        if cursor >= limit:
+            break
+    if cursor < limit:
+        segments.append((cursor, limit))
+    return [(segment_start, segment_end) for segment_start, segment_end in segments if segment_end > segment_start]
+
+
+def _overlay_segments_for_clip(clip, delete_ranges):
+    segments = []
+    for source_start, source_end in _kept_segments_for_range(clip.start, clip.end, delete_ranges):
+        output_start = _source_time_to_output_time(source_start, delete_ranges)
+        output_end = _source_time_to_output_time(source_end, delete_ranges)
+        if output_end <= output_start:
+            continue
+        media_source_start = clip.source_start + (source_start - clip.start)
+        media_source_end = media_source_start + (source_end - source_start)
+        segments.append((output_start, output_end, media_source_start, media_source_end))
+    return segments
+
+
+def _build_overlay_video_filter_parts(edit_plan, subtitle_path=None, keep_expression=None):
+    plan = edit_plan.normalized()
+    filter_parts = []
+    base_filters = []
+    if keep_expression:
+        base_filters.extend([f"select='{keep_expression}'", 'setpts=N/FRAME_RATE/TB'])
+    if plan.output.resolution:
+        width, height = plan.output.resolution
+        base_filters.append(_build_resolution_filter(width, height))
+
+    current_label = "vbase0"
+    filter_parts.append(f"[0:v:0]{','.join(base_filters or ['null'])}[{current_label}]")
+
+    delete_ranges = plan.delete_range_tuples()
+    overlay_counter = 0
+    for input_index, clip in enumerate(plan.media_overlays, start=1):
+        for segment_index, (output_start, output_end, source_start, source_end) in enumerate(
+            _overlay_segments_for_clip(clip, delete_ranges),
+            start=1,
+        ):
+            duration = output_end - output_start
+            raw_label = f"ovraw{input_index}_{segment_index}"
+            fit_label = f"ovfit{input_index}_{segment_index}"
+            ref_label = f"vref{input_index}_{segment_index}"
+            next_label = f"vov{overlay_counter + 1}"
+            if clip.media_kind == "video":
+                input_filters = [
+                    f"trim=start={_format_filter_number(source_start)}:end={_format_filter_number(source_end)}",
+                    f"setpts=PTS-STARTPTS+{_format_filter_number(output_start)}/TB",
+                    "format=rgba",
+                ]
+            else:
+                input_filters = [
+                    f"trim=duration={_format_filter_number(duration)}",
+                    f"setpts=PTS-STARTPTS+{_format_filter_number(output_start)}/TB",
+                    "format=rgba",
+                ]
+
+            filter_parts.append(f"[{input_index}:v:0]{','.join(input_filters)}[{raw_label}]")
+            filter_parts.append(
+                f"[{raw_label}][{current_label}]scale2ref=w=main_w:h=main_h[{fit_label}][{ref_label}]"
+            )
+            filter_parts.append(
+                f"[{ref_label}][{fit_label}]overlay=x=0:y=0:"
+                f"enable='between(t,{_format_filter_number(output_start)},{_format_filter_number(output_end)})':"
+                f"eof_action=pass:shortest=0[{next_label}]"
+            )
+            current_label = next_label
+            overlay_counter += 1
+
+    if subtitle_path and plan.subtitles.has_entries():
+        output_label = "vout"
+        filter_parts.append(f"[{current_label}]{_build_subtitles_filter(subtitle_path)}[{output_label}]")
+        return filter_parts, output_label
+
+    return filter_parts, current_label
 
 
 def prepare_subtitle_file_for_plan(edit_plan):
@@ -616,53 +725,77 @@ def build_ffmpeg_command_from_plan(
     """
     plan = edit_plan.normalized()
     audio_tracks = _audible_audio_tracks(plan)
+    media_overlays = plan.media_overlays
     cmd = [ffmpeg_path, '-y', '-i', str(input_path)]
+    for clip in media_overlays:
+        if clip.media_kind == "image":
+            cmd.extend(['-loop', '1', '-t', _format_filter_number(clip.duration)])
+        cmd.extend(['-i', clip.path])
     for track in audio_tracks:
         cmd.extend(['-i', track.path])
 
     has_subtitles = bool(subtitle_path and plan.subtitles.has_entries())
+    uses_complex_video = bool(media_overlays)
     uses_complex_audio = bool(audio_tracks)
     keep_expression = _build_keep_expression_from_plan(
         plan,
-        include_skip_without_delete=has_subtitles or uses_complex_audio,
+        include_skip_without_delete=has_subtitles or uses_complex_audio or uses_complex_video,
     )
 
     # 没有中间删除和字幕时沿用 -ss，避免改变既有极简剪开头行为。
-    if plan.skip_seconds > 0 and not plan.delete_ranges and not has_subtitles and not uses_complex_audio:
+    if (
+        plan.skip_seconds > 0
+        and not plan.delete_ranges
+        and not has_subtitles
+        and not uses_complex_audio
+        and not uses_complex_video
+    ):
         cmd.extend(['-ss', str(plan.skip_seconds)])
 
     # 视频编码器
     cmd.extend(['-c:v', 'libx264', '-preset', 'medium'])
 
-    video_filters = []
-    if has_subtitles:
-        video_filters.append(_build_subtitles_filter(subtitle_path))
+    filter_complex_parts = []
+    video_output_label = None
+    if uses_complex_video:
+        video_parts, video_output_label = _build_overlay_video_filter_parts(
+            plan,
+            subtitle_path=subtitle_path if has_subtitles else None,
+            keep_expression=keep_expression,
+        )
+        filter_complex_parts.extend(video_parts)
+    else:
+        video_filters = []
+        if has_subtitles:
+            video_filters.append(_build_subtitles_filter(subtitle_path))
 
-    if keep_expression:
-        video_filters.extend([f"select='{keep_expression}'", 'setpts=N/FRAME_RATE/TB'])
+        if keep_expression:
+            video_filters.extend([f"select='{keep_expression}'", 'setpts=N/FRAME_RATE/TB'])
 
-    if plan.output.resolution:
-        width, height = plan.output.resolution
-        video_filters.append(_build_resolution_filter(width, height))
+        if plan.output.resolution:
+            width, height = plan.output.resolution
+            video_filters.append(_build_resolution_filter(width, height))
 
-    if video_filters:
-        cmd.extend(['-vf', ','.join(video_filters)])
+        if video_filters:
+            cmd.extend(['-vf', ','.join(video_filters)])
 
     # 视频比特率
     if plan.output.video_bitrate:
         cmd.extend(['-b:v', plan.output.video_bitrate])
 
     # 音频
+    audio_output_label = None
     if uses_complex_audio:
         filter_complex = _build_audio_mix_filter(
             plan.source_audio_enabled(),
             audio_tracks,
             keep_expression=keep_expression,
             output_duration=output_duration,
+            first_audio_input_index=1 + len(media_overlays),
         )
         if filter_complex:
-            cmd.extend(['-filter_complex', filter_complex])
-            cmd.extend(['-map', '0:v:0', '-map', '[aout]'])
+            filter_complex_parts.append(filter_complex)
+            audio_output_label = "aout"
             cmd.extend(['-c:a', 'aac', '-b:a', plan.output.audio_bitrate])
         else:
             cmd.append('-an')
@@ -672,6 +805,18 @@ def build_ffmpeg_command_from_plan(
         cmd.extend(['-c:a', 'aac', '-b:a', plan.output.audio_bitrate])
     else:
         cmd.append('-an')
+
+    if filter_complex_parts:
+        cmd.extend(['-filter_complex', ';'.join(filter_complex_parts)])
+
+    if video_output_label:
+        cmd.extend(['-map', f'[{video_output_label}]'])
+        if audio_output_label:
+            cmd.extend(['-map', f'[{audio_output_label}]'])
+        elif plan.source_audio_enabled():
+            cmd.extend(['-map', '0:a:0?'])
+    elif audio_output_label:
+        cmd.extend(['-map', '0:v:0', '-map', f'[{audio_output_label}]'])
     
     # 输出
     cmd.append(str(output_path))
@@ -682,7 +827,7 @@ def build_ffmpeg_command_from_plan(
 def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0,
                          resolution=None, video_bitrate=None, audio_bitrate='128k',
                          delete_ranges=None, has_audio=True, source_audio_muted=False,
-                         audio_tracks=None, output_duration=None):
+                         audio_tracks=None, media_overlays=None, output_duration=None):
     """
     构建FFmpeg剪辑命令。
     兼容旧调用；新代码优先使用 build_ffmpeg_command_from_plan。
@@ -698,6 +843,7 @@ def build_ffmpeg_command(ffmpeg_path, input_path, output_path, skip_seconds=0,
         has_audio=has_audio,
         source_audio_muted=source_audio_muted,
         audio_tracks=tuple(audio_tracks or ()),
+        media_overlays=tuple(media_overlays or ()),
     )
     return build_ffmpeg_command_from_plan(
         ffmpeg_path,

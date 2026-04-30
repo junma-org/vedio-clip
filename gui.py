@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsObject,
+    QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
     QGridLayout,
@@ -63,7 +64,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from edit_model import AudioTrack, DeleteRange, EditPlan, OutputOptions, PlanValidationError, normalize_delete_ranges
+from edit_model import AudioTrack, DeleteRange, EditPlan, OverlayClip, OutputOptions, PlanValidationError, normalize_delete_ranges
 from ffmpeg_utils import (
     build_ffmpeg_command_from_plan,
     build_thumbnail_command,
@@ -84,10 +85,12 @@ from subtitle_model import (
     build_default_subtitle_project,
     build_style_preset,
     extract_fade_from_tags,
+    extract_position_from_tags,
     load_subtitle_file,
     load_subtitle_text,
     serialize_srt_entries,
     set_fade_on_tags,
+    set_position_on_tags,
 )
 from timeline_state import (
     TimelineSelection,
@@ -118,6 +121,13 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".ogg",
     ".wav",
     ".wma",
+}
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
 }
 
 STYLE_PRESET_LABELS = {
@@ -277,6 +287,8 @@ class VideoProcessThread(QThread):
                 action_parts.append(f"删除 {format_time(delete_range.start)}-{format_time(delete_range.end)}")
             if edit_plan.subtitles.has_entries():
                 action_parts.append(f"烧录字幕 {len(edit_plan.subtitles.cues)} 条")
+            if edit_plan.media_overlays:
+                action_parts.append(f"覆盖素材 {len(edit_plan.media_overlays)} 个")
             if edit_plan.source_audio_muted and video_info.get("has_audio", True):
                 action_parts.append("静音源音")
             if edit_plan.audio_tracks:
@@ -615,13 +627,7 @@ class SubtitleOverlayItem(QGraphicsObject):
         margin_r = int(round(style.margin_r * scale))
         margin_v = int(round(style.margin_v * scale))
 
-        draw_rect = self._rect.adjusted(margin_l, 20, -margin_r, -20)
         row = (style.alignment - 1) // 3
-        if row == 0:
-            draw_rect = draw_rect.adjusted(0, 0, 0, -margin_v)
-        elif row == 2:
-            draw_rect = draw_rect.adjusted(0, margin_v, 0, 0)
-
         flags = Qt.TextWordWrap
         column = (style.alignment - 1) % 3
         if column == 0:
@@ -637,6 +643,35 @@ class SubtitleOverlayItem(QGraphicsObject):
             flags |= Qt.AlignVCenter
         else:
             flags |= Qt.AlignTop
+
+        position = extract_position_from_tags(cue.raw_tags)
+        if position:
+            x_scale = self._rect.width() / max(1, self._project.play_res_x)
+            y_scale = self._rect.height() / max(1, self._project.play_res_y)
+            anchor_x = position[0] * x_scale
+            anchor_y = position[1] * y_scale
+            max_width = max(40.0, self._rect.width() - margin_l - margin_r)
+            bounds = painter.boundingRect(QRectF(0, 0, max_width, self._rect.height()), flags, cue.text)
+            text_height = max(float(font.pixelSize() if font.pixelSize() > 0 else font.pointSize()), bounds.height())
+            if column == 0:
+                left = anchor_x
+            elif column == 1:
+                left = anchor_x - max_width / 2
+            else:
+                left = anchor_x - max_width
+            if row == 0:
+                top = anchor_y - text_height
+            elif row == 1:
+                top = anchor_y - text_height / 2
+            else:
+                top = anchor_y
+            draw_rect = QRectF(left, top, max_width, text_height + 4)
+        else:
+            draw_rect = self._rect.adjusted(margin_l, 20, -margin_r, -20)
+            if row == 0:
+                draw_rect = draw_rect.adjusted(0, 0, 0, -margin_v)
+            elif row == 2:
+                draw_rect = draw_rect.adjusted(0, margin_v, 0, 0)
 
         outline_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         painter.setPen(QPen(outline, max(1, style.outline * scale)))
@@ -673,8 +708,11 @@ class MainWindow(QMainWindow):
         self.current_video_has_audio = True
         self.source_audio_muted = False
         self.audio_tracks = []
+        self.media_overlays = []
+        self._selected_overlay_index = -1
         self.audio_track_volume_spins = []
         self.audio_track_remove_buttons = []
+        self._overlay_preview_records = []
         self.available_subtitle_fonts = subtitle_font_options()
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
 
@@ -688,6 +726,9 @@ class MainWindow(QMainWindow):
         self._syncing_subtitle_editor = False
         self._syncing_resolution_controls = False
         self._syncing_audio_controls = False
+        self._syncing_overlay_controls = False
+        self._syncing_timeline_controls = False
+        self._syncing_deleted_preview_skip = False
         self._subtitle_timing_dirty = False
         self._subtitle_color = QColor("#ffffff")
         self._undo_stack = []
@@ -947,6 +988,30 @@ class MainWindow(QMainWindow):
         self.timeline_widget.selectionChanged.connect(self.on_timeline_selection_changed)
         self.timeline_widget.subtitleActivated.connect(self.select_subtitle_row)
         self.timeline_widget.subtitleTimingPreviewed.connect(self.on_subtitle_timing_previewed)
+        self.timeline_widget.overlayActivated.connect(self.select_overlay_row)
+        self.timeline_widget.overlayTimingPreviewed.connect(self.on_overlay_timing_previewed)
+        self.timeline_widget.overlayTimingChanged.connect(self.on_overlay_timing_changed)
+
+        timeline_tools_layout = QHBoxLayout()
+        timeline_tools_layout.addWidget(QLabel("时间线"))
+        self.timeline_zoom_down_button = QPushButton("-")
+        self.timeline_zoom_down_button.clicked.connect(lambda: self.set_timeline_zoom_value(self.timeline_zoom_slider.value() - 5))
+        timeline_tools_layout.addWidget(self.timeline_zoom_down_button)
+        self.timeline_zoom_slider = QSlider(Qt.Horizontal)
+        self.timeline_zoom_slider.setRange(10, 120)
+        self.timeline_zoom_slider.setValue(10)
+        self.timeline_zoom_slider.valueChanged.connect(self.on_timeline_zoom_changed)
+        timeline_tools_layout.addWidget(self.timeline_zoom_slider, 1)
+        self.timeline_zoom_up_button = QPushButton("+")
+        self.timeline_zoom_up_button.clicked.connect(lambda: self.set_timeline_zoom_value(self.timeline_zoom_slider.value() + 5))
+        timeline_tools_layout.addWidget(self.timeline_zoom_up_button)
+        self.timeline_zoom_label = QLabel("1.0x")
+        timeline_tools_layout.addWidget(self.timeline_zoom_label)
+        self.timeline_scroll_slider = QSlider(Qt.Horizontal)
+        self.timeline_scroll_slider.setRange(0, 0)
+        self.timeline_scroll_slider.valueChanged.connect(self.on_timeline_scroll_changed)
+        timeline_tools_layout.addWidget(self.timeline_scroll_slider, 2)
+        left_panel.addLayout(timeline_tools_layout)
         left_panel.addWidget(self.timeline_widget)
 
         delete_actions_layout = QHBoxLayout()
@@ -1013,6 +1078,12 @@ class MainWindow(QMainWindow):
         audio_layout.setSpacing(10)
         self.expert_side_tabs.addTab(audio_tab, "音频")
 
+        material_tab = QWidget()
+        material_layout = QVBoxLayout(material_tab)
+        material_layout.setContentsMargins(0, 8, 0, 0)
+        material_layout.setSpacing(10)
+        self.expert_side_tabs.addTab(material_tab, "素材")
+
         style_layout = QHBoxLayout()
         style_layout.addWidget(QLabel("字幕模板"))
         self.subtitle_style_combo = QComboBox()
@@ -1054,6 +1125,30 @@ class MainWindow(QMainWindow):
         self.subtitle_fade_ms_spin.valueChanged.connect(self.on_subtitle_effect_controls_changed)
         color_effect_layout.addWidget(self.subtitle_fade_ms_spin)
         subtitle_layout.addLayout(color_effect_layout)
+
+        position_layout = QHBoxLayout()
+        position_layout.addWidget(QLabel("位置"))
+        self.subtitle_position_step_spin = QSpinBox()
+        self.subtitle_position_step_spin.setRange(1, 200)
+        self.subtitle_position_step_spin.setValue(12)
+        self.subtitle_position_step_spin.setSuffix(" px")
+        position_layout.addWidget(self.subtitle_position_step_spin)
+        self.subtitle_move_left_button = QPushButton("左")
+        self.subtitle_move_left_button.clicked.connect(lambda: self.move_selected_subtitle_position(-1, 0))
+        position_layout.addWidget(self.subtitle_move_left_button)
+        self.subtitle_move_right_button = QPushButton("右")
+        self.subtitle_move_right_button.clicked.connect(lambda: self.move_selected_subtitle_position(1, 0))
+        position_layout.addWidget(self.subtitle_move_right_button)
+        self.subtitle_move_up_button = QPushButton("上")
+        self.subtitle_move_up_button.clicked.connect(lambda: self.move_selected_subtitle_position(0, -1))
+        position_layout.addWidget(self.subtitle_move_up_button)
+        self.subtitle_move_down_button = QPushButton("下")
+        self.subtitle_move_down_button.clicked.connect(lambda: self.move_selected_subtitle_position(0, 1))
+        position_layout.addWidget(self.subtitle_move_down_button)
+        self.subtitle_reset_position_button = QPushButton("复位")
+        self.subtitle_reset_position_button.clicked.connect(self.reset_selected_subtitle_positions)
+        position_layout.addWidget(self.subtitle_reset_position_button)
+        subtitle_layout.addLayout(position_layout)
 
         import_layout = QHBoxLayout()
         self.recognize_subtitle_button = QPushButton("识别")
@@ -1138,10 +1233,51 @@ class MainWindow(QMainWindow):
         audio_layout.addLayout(self.audio_track_controls_layout)
         audio_layout.addStretch()
 
+        material_actions_layout = QHBoxLayout()
+        self.add_image_overlay_button = QPushButton("添加图片")
+        self.add_image_overlay_button.clicked.connect(self.add_image_overlay)
+        material_actions_layout.addWidget(self.add_image_overlay_button)
+        self.add_video_overlay_button = QPushButton("添加视频")
+        self.add_video_overlay_button.clicked.connect(self.add_video_overlay)
+        material_actions_layout.addWidget(self.add_video_overlay_button)
+        material_layout.addLayout(material_actions_layout)
+
+        self.overlay_list = QListWidget()
+        self.overlay_list.itemSelectionChanged.connect(self.on_overlay_selection_changed)
+        material_layout.addWidget(self.overlay_list, 1)
+
+        overlay_time_layout = QHBoxLayout()
+        overlay_time_layout.addWidget(QLabel("开始"))
+        self.overlay_start_spin = QDoubleSpinBox()
+        self.overlay_start_spin.setRange(0, 24 * 3600)
+        self.overlay_start_spin.setDecimals(2)
+        self.overlay_start_spin.setSingleStep(0.1)
+        self.overlay_start_spin.setSuffix(" 秒")
+        self.overlay_start_spin.editingFinished.connect(self.apply_overlay_timing_from_controls)
+        overlay_time_layout.addWidget(self.overlay_start_spin)
+        overlay_time_layout.addWidget(QLabel("结束"))
+        self.overlay_end_spin = QDoubleSpinBox()
+        self.overlay_end_spin.setRange(0, 24 * 3600)
+        self.overlay_end_spin.setDecimals(2)
+        self.overlay_end_spin.setSingleStep(0.1)
+        self.overlay_end_spin.setSuffix(" 秒")
+        self.overlay_end_spin.editingFinished.connect(self.apply_overlay_timing_from_controls)
+        overlay_time_layout.addWidget(self.overlay_end_spin)
+        material_layout.addLayout(overlay_time_layout)
+
+        overlay_button_layout = QHBoxLayout()
+        self.remove_overlay_button = QPushButton("删除素材")
+        self.remove_overlay_button.clicked.connect(self.remove_selected_overlay)
+        overlay_button_layout.addWidget(self.remove_overlay_button)
+        overlay_button_layout.addStretch()
+        material_layout.addLayout(overlay_button_layout)
+        material_layout.addStretch()
+
         self.refresh_style_combo()
         self.refresh_expert_delete_ranges_list()
         self.refresh_subtitle_table()
         self.refresh_audio_controls()
+        self.refresh_overlay_list()
         return page
 
     def apply_mode_button_styles(self):
@@ -1229,6 +1365,8 @@ class MainWindow(QMainWindow):
             "expert_output_resolution": self.expert_output_resolution,
             "source_audio_muted": self.source_audio_muted,
             "audio_tracks": list(self.audio_tracks),
+            "media_overlays": list(self.media_overlays),
+            "selected_overlay_index": self._selected_overlay_index,
             "subtitle_project": self.subtitle_project,
             "subtitle_row": subtitle_row,
         }
@@ -1262,16 +1400,22 @@ class MainWindow(QMainWindow):
             self.expert_output_resolution = state["expert_output_resolution"]
             self.source_audio_muted = bool(state.get("source_audio_muted", False))
             self.audio_tracks = list(state.get("audio_tracks", []))
+            self.media_overlays = list(state.get("media_overlays", []))
+            self._selected_overlay_index = int(state.get("selected_overlay_index", -1))
             self.subtitle_project = state["subtitle_project"].normalized()
             self._subtitle_timing_dirty = False
 
             self.refresh_delete_ranges_list()
             self.refresh_expert_delete_ranges_list()
             self.refresh_audio_controls()
+            self.refresh_overlay_list()
             self.refresh_style_combo()
             self.refresh_subtitle_table()
             self.timeline_widget.set_selection(self.expert_selection)
+            self.timeline_widget.set_overlay_clips(self.media_overlays)
+            self.timeline_widget.set_selected_overlay_index(self._selected_overlay_index)
             self.timeline_widget.set_subtitle_cues(self.subtitle_project.cues)
+            self.sync_deleted_preview_after_ranges()
 
             self._syncing_resolution_controls = True
             self.expert_res_combo.setCurrentIndex(self._combo_index_for_data(self.expert_res_combo, self.expert_output_resolution))
@@ -1285,6 +1429,7 @@ class MainWindow(QMainWindow):
             else:
                 self.subtitle_table.clearSelection()
                 self.on_subtitle_selection_changed()
+            self.select_overlay_row(self._selected_overlay_index)
             self.status_label.setText("已撤销上一次操作")
         finally:
             self._restoring_state = False
@@ -1344,6 +1489,8 @@ class MainWindow(QMainWindow):
         self.current_video_has_audio = True
         self.source_audio_muted = False
         self.audio_tracks = []
+        self.media_overlays = []
+        self._selected_overlay_index = -1
         self._subtitle_timing_dirty = False
         self.clear_undo_stack()
         self._syncing_resolution_controls = True
@@ -1352,8 +1499,15 @@ class MainWindow(QMainWindow):
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
         self.timeline_widget.set_duration(0)
         self.timeline_widget.set_playhead(0)
+        self.timeline_widget.set_zoom(1)
+        self.timeline_widget.set_view_start(0)
+        self._syncing_timeline_controls = True
+        self.timeline_zoom_slider.setValue(10)
+        self._syncing_timeline_controls = False
         self.timeline_widget.set_selection(self.expert_selection)
         self.timeline_widget.set_delete_ranges([])
+        self.timeline_widget.set_overlay_clips([])
+        self.timeline_widget.set_selected_overlay_index(-1)
         self.timeline_widget.set_subtitle_cues([])
         self.subtitle_text_edit.clear()
         self.subtitle_start_spin.setValue(0)
@@ -1363,6 +1517,9 @@ class MainWindow(QMainWindow):
         self.refresh_expert_delete_ranges_list()
         self.refresh_subtitle_table()
         self.refresh_audio_controls()
+        self.refresh_overlay_list()
+        self.clear_overlay_preview_items()
+        self.refresh_timeline_scroll_controls()
         self.expert_preview_stack.setCurrentWidget(self.expert_preview_empty)
         self.expert_current_label.setText("0:00")
         self.expert_duration_label.setText("0:00")
@@ -1402,14 +1559,19 @@ class MainWindow(QMainWindow):
         self.timeline_widget.set_playhead(0)
         self.timeline_widget.set_selection(self.expert_selection)
         self.timeline_widget.set_delete_ranges(self.expert_delete_ranges)
+        self.timeline_widget.set_overlay_clips(self.media_overlays)
+        self.timeline_widget.set_selected_overlay_index(self._selected_overlay_index)
         self.timeline_widget.set_subtitle_cues(self.subtitle_project.cues)
         self.refresh_audio_controls()
+        self.refresh_overlay_list()
+        self.refresh_timeline_scroll_controls()
 
         if MULTIMEDIA_AVAILABLE:
             self.ensure_expert_player()
             self.media_player.stop()
             self.media_player.setSource(QUrl.fromLocalFile(str(self.current_file)))
             self.apply_expert_preview_resolution()
+            self.refresh_overlay_preview_items()
             self.expert_preview_stack.setCurrentWidget(self.expert_preview_container)
         else:
             self.expert_preview_empty.setText("当前环境不支持视频预览")
@@ -1433,7 +1595,7 @@ class MainWindow(QMainWindow):
         self.video_item.setZValue(0)
         self.video_scene.addItem(self.video_item)
         self.subtitle_overlay_item = SubtitleOverlayItem()
-        self.subtitle_overlay_item.setZValue(1)
+        self.subtitle_overlay_item.setZValue(2)
         self.video_scene.addItem(self.subtitle_overlay_item)
         self.video_scene.setBackgroundBrush(QColor("#000000"))
         self.video_scene.setSceneRect(QRectF(0, 0, 1280, 720))
@@ -1504,6 +1666,8 @@ class MainWindow(QMainWindow):
             self.subtitle_overlay_item.set_canvas_size(width, height)
             self.subtitle_overlay_item.set_project(self.subtitle_project)
             self.subtitle_overlay_item.set_current_time(self.current_expert_seconds())
+        self.sync_overlay_preview_geometry()
+        self.sync_overlay_preview_at(self.current_expert_seconds())
         self.video_scene.update(self.video_scene.sceneRect())
         self.sync_expert_preview_view()
         QTimer.singleShot(0, self.sync_expert_preview_view)
@@ -1527,14 +1691,25 @@ class MainWindow(QMainWindow):
         self._syncing_expert_position = True
         self.expert_position_slider.setRange(0, max(0, int(milliseconds)))
         self._syncing_expert_position = False
+        self.refresh_timeline_scroll_controls()
         self.update_expert_controls_state()
 
     def on_expert_position_changed(self, milliseconds):
         seconds = max(0.0, milliseconds / 1000)
+        if not self._syncing_deleted_preview_skip:
+            skip_target = self.deleted_preview_skip_target(seconds)
+            if skip_target is not None:
+                self._syncing_deleted_preview_skip = True
+                self.media_player.setPosition(max(0, int(skip_target * 1000)))
+                self._syncing_deleted_preview_skip = False
+                return
+
         self.expert_current_label.setText(format_time(seconds))
         self.timeline_widget.set_playhead(seconds)
+        self.sync_timeline_scroll_from_widget()
         if self.subtitle_overlay_item is not None:
             self.subtitle_overlay_item.set_current_time(seconds)
+        self.sync_overlay_preview_at(seconds)
 
         self._syncing_expert_position = True
         self.expert_position_slider.setValue(max(0, int(milliseconds)))
@@ -1545,6 +1720,7 @@ class MainWindow(QMainWindow):
             self.expert_play_button.setText("暂停")
         else:
             self.expert_play_button.setText("播放")
+        self.sync_overlay_preview_at(self.current_expert_seconds())
 
     def on_expert_media_error(self, *_args):
         if self.media_player is None:
@@ -1567,21 +1743,77 @@ class MainWindow(QMainWindow):
         self.media_player.setPosition(max(0, int(milliseconds)))
 
     def seek_expert_seconds(self, seconds):
-        target_ms = max(0, int(float(seconds) * 1000))
+        seconds = self.adjust_preview_seconds_for_deletes(float(seconds))
+        target_ms = max(0, int(seconds * 1000))
         if self.media_player is not None:
             self.media_player.setPosition(target_ms)
-            self.expert_current_label.setText(format_time(float(seconds)))
+            self.expert_current_label.setText(format_time(seconds))
             if self.subtitle_overlay_item is not None:
-                self.subtitle_overlay_item.set_current_time(float(seconds))
+                self.subtitle_overlay_item.set_current_time(seconds)
+            self.sync_overlay_preview_at(seconds)
         else:
             self.timeline_widget.set_playhead(seconds)
             if self.subtitle_overlay_item is not None:
                 self.subtitle_overlay_item.set_current_time(seconds)
+            self.sync_overlay_preview_at(seconds)
 
     def current_expert_seconds(self):
         if self.media_player is not None:
             return max(0.0, self.media_player.position() / 1000)
         return self.timeline_widget.playhead
+
+    def deleted_preview_skip_target(self, seconds):
+        for start, end in self.expert_delete_ranges:
+            if start <= seconds < end:
+                return min(self.expert_duration_seconds, end + 0.001)
+        return None
+
+    def adjust_preview_seconds_for_deletes(self, seconds):
+        target = self.deleted_preview_skip_target(seconds)
+        return seconds if target is None else target
+
+    def sync_deleted_preview_after_ranges(self):
+        target = self.deleted_preview_skip_target(self.current_expert_seconds())
+        if target is not None:
+            self.seek_expert_seconds(target)
+
+    def set_timeline_zoom_value(self, value):
+        if not hasattr(self, "timeline_zoom_slider"):
+            return
+        self.timeline_zoom_slider.setValue(max(self.timeline_zoom_slider.minimum(), min(value, self.timeline_zoom_slider.maximum())))
+
+    def on_timeline_zoom_changed(self, value):
+        if self._syncing_timeline_controls:
+            return
+        zoom = max(1.0, float(value) / 10.0)
+        self.timeline_widget.set_zoom(zoom)
+        self.timeline_zoom_label.setText(f"{zoom:.1f}x")
+        self.refresh_timeline_scroll_controls()
+
+    def on_timeline_scroll_changed(self, value):
+        if self._syncing_timeline_controls:
+            return
+        max_start = max(0.0, self.expert_duration_seconds - self.timeline_widget.visible_duration())
+        self.timeline_widget.set_view_start((float(value) / 1000.0) * max_start if max_start > 0 else 0)
+
+    def refresh_timeline_scroll_controls(self):
+        if not hasattr(self, "timeline_scroll_slider"):
+            return
+        max_start = max(0.0, self.expert_duration_seconds - self.timeline_widget.visible_duration())
+        self._syncing_timeline_controls = True
+        try:
+            self.timeline_scroll_slider.setEnabled(max_start > 0)
+            self.timeline_scroll_slider.setRange(0, 1000 if max_start > 0 else 0)
+            value = 0 if max_start <= 0 else int((self.timeline_widget.view_start / max_start) * 1000)
+            self.timeline_scroll_slider.setValue(max(0, min(1000, value)))
+            self.timeline_zoom_label.setText(f"{self.timeline_widget.zoom:.1f}x")
+        finally:
+            self._syncing_timeline_controls = False
+
+    def sync_timeline_scroll_from_widget(self):
+        if self._syncing_timeline_controls:
+            return
+        self.refresh_timeline_scroll_controls()
 
     def on_timeline_selection_changed(self, start, end):
         self.expert_selection = TimelineSelection(start, end)
@@ -1903,6 +2135,80 @@ class MainWindow(QMainWindow):
         project = self.subtitle_project_with_cues(self.subtitle_project, cues)
         self.set_subtitle_project_after_edit(project, rows, f"已更新 {len(rows)} 条字幕效果", reload_editor=False, refresh_styles=False)
 
+    def default_subtitle_position(self, cue):
+        project = self.subtitle_project.normalized()
+        style = project.style_map().get(cue.style_name, project.style)
+        column = (style.alignment - 1) % 3
+        row = (style.alignment - 1) // 3
+        if column == 0:
+            x = style.margin_l
+        elif column == 1:
+            x = project.play_res_x / 2
+        else:
+            x = project.play_res_x - style.margin_r
+        if row == 0:
+            y = project.play_res_y - style.margin_v
+        elif row == 1:
+            y = project.play_res_y / 2
+        else:
+            y = style.margin_v
+        return float(x), float(y)
+
+    def current_subtitle_position(self, cue):
+        return extract_position_from_tags(cue.raw_tags) or self.default_subtitle_position(cue)
+
+    def subtitle_cue_with_position(self, cue, x=None, y=None):
+        return SubtitleCue(
+            start=cue.start,
+            end=cue.end,
+            text=cue.text,
+            style_name=cue.style_name,
+            source_kind=cue.source_kind,
+            raw_tags=set_position_on_tags(cue.raw_tags, x, y),
+            raw_text="",
+            layer=cue.layer,
+        ).normalized()
+
+    def move_selected_subtitle_position(self, direction_x, direction_y):
+        rows = self.selected_subtitle_rows()
+        if not rows:
+            return
+        step = self.subtitle_position_step_spin.value()
+        dx = float(direction_x) * step
+        dy = float(direction_y) * step
+        project = self.subtitle_project.normalized()
+        cues = list(project.cues)
+        for row in rows:
+            cue = cues[row]
+            x, y = self.current_subtitle_position(cue)
+            x = max(0.0, min(project.play_res_x, x + dx))
+            y = max(0.0, min(project.play_res_y, y + dy))
+            cues[row] = self.subtitle_cue_with_position(cue, x, y)
+        updated = self.subtitle_project_with_cues(project, cues)
+        self.set_subtitle_project_after_edit(
+            updated,
+            rows,
+            f"已移动 {len(rows)} 条字幕位置",
+            reload_editor=False,
+            refresh_styles=False,
+        )
+
+    def reset_selected_subtitle_positions(self):
+        rows = self.selected_subtitle_rows()
+        if not rows:
+            return
+        cues = list(self.subtitle_project.cues)
+        for row in rows:
+            cues[row] = self.subtitle_cue_with_position(cues[row], None, None)
+        project = self.subtitle_project_with_cues(self.subtitle_project, cues)
+        self.set_subtitle_project_after_edit(
+            project,
+            rows,
+            f"已复位 {len(rows)} 条字幕位置",
+            reload_editor=False,
+            refresh_styles=False,
+        )
+
     def apply_current_subtitle_from_editor(self, status, reload_editor):
         rows = self.selected_subtitle_rows()
         if len(rows) != 1:
@@ -1988,6 +2294,7 @@ class MainWindow(QMainWindow):
         self.expert_selection = TimelineSelection(self.expert_selection.end, self.expert_selection.end)
         self.timeline_widget.set_selection(self.expert_selection)
         self.refresh_expert_delete_ranges_list()
+        self.sync_deleted_preview_after_ranges()
         self.status_label.setText(f"已加入删除片段，共 {len(self.expert_delete_ranges)} 段")
         self.update_expert_controls_state()
 
@@ -2006,6 +2313,7 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         self.expert_delete_ranges = [item.as_tuple() for item in ranges]
         self.refresh_expert_delete_ranges_list()
+        self.sync_deleted_preview_after_ranges()
         self.status_label.setText(f"已删除当前帧，共 {len(self.expert_delete_ranges)} 段")
 
     def remove_selected_expert_delete_range(self):
@@ -2015,6 +2323,7 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         del self.expert_delete_ranges[row]
         self.refresh_expert_delete_ranges_list()
+        self.sync_deleted_preview_after_ranges()
         self.status_label.setText(f"已删除片段，剩余 {len(self.expert_delete_ranges)} 段")
 
     def clear_expert_delete_ranges(self):
@@ -2025,6 +2334,7 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         self.expert_delete_ranges = []
         self.refresh_expert_delete_ranges_list()
+        self.sync_deleted_preview_after_ranges()
         self.status_label.setText("已清空删除片段")
 
     def refresh_subtitle_table(self):
@@ -2119,6 +2429,17 @@ class MainWindow(QMainWindow):
             self.copy_subtitles_action.setEnabled(has_selection)
         if hasattr(self, "delete_subtitles_action"):
             self.delete_subtitles_action.setEnabled(enabled and has_selection)
+        for button_name in (
+            "subtitle_move_left_button",
+            "subtitle_move_right_button",
+            "subtitle_move_up_button",
+            "subtitle_move_down_button",
+            "subtitle_reset_position_button",
+        ):
+            if hasattr(self, button_name):
+                getattr(self, button_name).setEnabled(enabled and has_selection)
+        if hasattr(self, "subtitle_position_step_spin"):
+            self.subtitle_position_step_spin.setEnabled(enabled and has_selection)
         self.recognize_subtitle_button.setEnabled(enabled and self.ffmpeg_path is not None and self.has_transcribable_audio())
 
     def has_transcribable_audio(self):
@@ -2189,6 +2510,18 @@ class MainWindow(QMainWindow):
         for button in getattr(self, "audio_track_remove_buttons", []):
             button.setEnabled(enabled)
 
+    def update_overlay_buttons(self):
+        if not hasattr(self, "overlay_list"):
+            return
+        enabled = self.current_file is not None and self.process_thread is None and self.transcribe_thread is None
+        has_selection = self.selected_overlay_index() >= 0
+        self.add_image_overlay_button.setEnabled(enabled)
+        self.add_video_overlay_button.setEnabled(enabled)
+        self.overlay_list.setEnabled(enabled)
+        self.overlay_start_spin.setEnabled(enabled and has_selection)
+        self.overlay_end_spin.setEnabled(enabled and has_selection)
+        self.remove_overlay_button.setEnabled(enabled and has_selection)
+
     def on_source_audio_toggled(self, checked):
         if self._syncing_audio_controls:
             return
@@ -2245,6 +2578,333 @@ class MainWindow(QMainWindow):
         self.refresh_audio_controls()
         self.update_expert_controls_state()
         self.status_label.setText(f"已删除音频，剩余 {len(self.audio_tracks)} 条")
+
+    def overlay_range_from_selection(self, default_duration):
+        if self.expert_selection.is_range:
+            start = self.expert_selection.start
+            end = self.expert_selection.end
+        else:
+            start = self.current_expert_seconds()
+            end = start + default_duration
+        if self.expert_duration_seconds > 0:
+            start = max(0.0, min(start, self.expert_duration_seconds))
+            end = max(start + 0.1, min(end, self.expert_duration_seconds))
+            if end > self.expert_duration_seconds:
+                end = self.expert_duration_seconds
+                start = max(0.0, end - default_duration)
+        return start, end
+
+    def add_image_overlay(self):
+        if self.current_file is None:
+            QMessageBox.information(self, "请先选择视频", "请先打开一个视频。")
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "添加图片覆盖素材",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            QMessageBox.warning(self, "文件无效", "选择的图片文件不存在。")
+            return
+        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            QMessageBox.warning(self, "格式不支持", "请选择常见图片文件，例如 PNG、JPG、WEBP。")
+            return
+        start, end = self.overlay_range_from_selection(3.0)
+        clip = OverlayClip(str(path), "image", start, end).validate()
+        self.push_undo_state()
+        self.media_overlays.append(clip)
+        self._selected_overlay_index = len(self.media_overlays) - 1
+        self.refresh_overlay_list()
+        self.select_overlay_row(self._selected_overlay_index)
+        self.status_label.setText(f"已添加图片覆盖素材，共 {len(self.media_overlays)} 个")
+        self.update_expert_controls_state()
+
+    def add_video_overlay(self):
+        if self.current_file is None:
+            QMessageBox.information(self, "请先选择视频", "请先打开一个视频。")
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "添加视频覆盖素材",
+            "",
+            "视频文件 (*.mp4 *.avi *.mkv *.mov *.flv *.wmv *.webm *.m4v);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            QMessageBox.warning(self, "文件无效", "选择的视频文件不存在。")
+            return
+        if path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+            QMessageBox.warning(self, "格式不支持", "请选择常见视频文件，例如 MP4、MOV、MKV。")
+            return
+
+        source_duration = 3.0
+        if self.ffmpeg_path is not None:
+            source_info = get_video_info(self.ffmpeg_path, path)
+            source_duration = max(0.1, float(source_info.get("duration", 3.0) or 3.0))
+        default_duration = min(3.0, source_duration)
+        start, end = self.overlay_range_from_selection(default_duration)
+        if end - start > source_duration:
+            end = start + source_duration
+        clip = OverlayClip(str(path), "video", start, end, 0, min(source_duration, end - start)).validate()
+        self.push_undo_state()
+        self.media_overlays.append(clip)
+        self._selected_overlay_index = len(self.media_overlays) - 1
+        self.refresh_overlay_list()
+        self.select_overlay_row(self._selected_overlay_index)
+        self.status_label.setText(f"已添加视频覆盖素材，共 {len(self.media_overlays)} 个")
+        self.update_expert_controls_state()
+
+    def overlay_label(self, index, clip):
+        media_label = "图片" if clip.media_kind == "image" else "视频"
+        return f"{index + 1}. {media_label} {Path(clip.path).name}  {format_time(clip.start)} - {format_time(clip.end)}"
+
+    def refresh_overlay_list(self):
+        if not hasattr(self, "overlay_list"):
+            return
+        selected = self._selected_overlay_index
+        self._syncing_overlay_controls = True
+        try:
+            self.overlay_list.clear()
+            for index, clip in enumerate(self.media_overlays):
+                self.overlay_list.addItem(self.overlay_label(index, clip))
+            if 0 <= selected < len(self.media_overlays):
+                self.overlay_list.setCurrentRow(selected)
+            else:
+                self._selected_overlay_index = -1
+            self.load_overlay_controls()
+        finally:
+            self._syncing_overlay_controls = False
+        self.timeline_widget.set_overlay_clips(self.media_overlays)
+        self.timeline_widget.set_selected_overlay_index(self._selected_overlay_index)
+        self.refresh_overlay_preview_items()
+        self.update_overlay_buttons()
+
+    def selected_overlay_index(self):
+        row = self.overlay_list.currentRow() if hasattr(self, "overlay_list") else -1
+        if 0 <= row < len(self.media_overlays):
+            return row
+        if 0 <= self._selected_overlay_index < len(self.media_overlays):
+            return self._selected_overlay_index
+        return -1
+
+    def select_overlay_row(self, index):
+        if not hasattr(self, "overlay_list"):
+            return
+        if index < 0 or index >= len(self.media_overlays):
+            self._selected_overlay_index = -1
+            self.overlay_list.clearSelection()
+            self.load_overlay_controls()
+            self.timeline_widget.set_selected_overlay_index(-1)
+            self.update_overlay_buttons()
+            return
+        self._selected_overlay_index = index
+        if self.overlay_list.currentRow() != index:
+            self.overlay_list.setCurrentRow(index)
+        self.load_overlay_controls()
+        self.timeline_widget.set_selected_overlay_index(index)
+        self.update_overlay_buttons()
+
+    def on_overlay_selection_changed(self):
+        if self._syncing_overlay_controls:
+            return
+        self._selected_overlay_index = self.selected_overlay_index()
+        self.timeline_widget.set_selected_overlay_index(self._selected_overlay_index)
+        self.load_overlay_controls()
+        self.update_overlay_buttons()
+
+    def load_overlay_controls(self):
+        if not hasattr(self, "overlay_start_spin"):
+            return
+        index = self.selected_overlay_index()
+        self._syncing_overlay_controls = True
+        try:
+            if index < 0:
+                self.overlay_start_spin.setValue(0)
+                self.overlay_end_spin.setValue(0)
+                return
+            clip = self.media_overlays[index]
+            self.overlay_start_spin.setValue(clip.start)
+            self.overlay_end_spin.setValue(clip.end)
+        finally:
+            self._syncing_overlay_controls = False
+
+    def apply_overlay_timing_from_controls(self):
+        if self._syncing_overlay_controls:
+            return
+        index = self.selected_overlay_index()
+        if index < 0:
+            return
+        start = self.overlay_start_spin.value()
+        end = self.overlay_end_spin.value()
+        if end <= start:
+            QMessageBox.warning(self, "覆盖素材时间无效", "结束秒数必须大于开始秒数。")
+            self.load_overlay_controls()
+            return
+        original = self.media_overlays[index]
+        source_end = original.source_end
+        if original.media_kind == "video":
+            source_end = original.source_start + (end - start)
+        try:
+            clip = OverlayClip(
+                original.path,
+                original.media_kind,
+                start,
+                end,
+                original.source_start,
+                source_end,
+            ).validate()
+        except PlanValidationError as exc:
+            QMessageBox.warning(self, "覆盖素材时间无效", str(exc))
+            self.load_overlay_controls()
+            return
+        if clip == original:
+            return
+        self.push_undo_state()
+        self.media_overlays[index] = clip
+        self._selected_overlay_index = index
+        self.refresh_overlay_list()
+        self.select_overlay_row(index)
+        self.status_label.setText("已更新覆盖素材时间")
+
+    def on_overlay_timing_previewed(self, row, clip, _playhead):
+        if row < 0 or row >= len(self.media_overlays):
+            return
+        self._selected_overlay_index = row
+        self.overlay_start_spin.setValue(clip.start)
+        self.overlay_end_spin.setValue(clip.end)
+        self.status_label.setText("正在调整覆盖素材时间")
+
+    def on_overlay_timing_changed(self, row, clip, playhead):
+        if row < 0 or row >= len(self.media_overlays):
+            return
+        self.push_undo_state()
+        self.media_overlays[row] = clip.validate()
+        self._selected_overlay_index = row
+        self.refresh_overlay_list()
+        self.select_overlay_row(row)
+        self.seek_expert_seconds(playhead)
+        self.status_label.setText("已更新覆盖素材时间")
+        self.update_expert_controls_state()
+
+    def remove_selected_overlay(self):
+        index = self.selected_overlay_index()
+        if index < 0:
+            return
+        self.push_undo_state()
+        del self.media_overlays[index]
+        self._selected_overlay_index = min(index, len(self.media_overlays) - 1)
+        self.refresh_overlay_list()
+        self.select_overlay_row(self._selected_overlay_index)
+        self.status_label.setText(f"已删除覆盖素材，剩余 {len(self.media_overlays)} 个")
+        self.update_expert_controls_state()
+
+    def clear_overlay_preview_items(self):
+        for record in getattr(self, "_overlay_preview_records", []):
+            player = record.get("player")
+            if player is not None:
+                player.stop()
+                player.deleteLater()
+            audio_output = record.get("audio_output")
+            if audio_output is not None:
+                audio_output.deleteLater()
+            item = record.get("item")
+            if item is not None and self.video_scene is not None:
+                self.video_scene.removeItem(item)
+        self._overlay_preview_records = []
+
+    def refresh_overlay_preview_items(self):
+        if self.video_scene is None:
+            return
+        self.clear_overlay_preview_items()
+        if not self.media_overlays:
+            return
+        for clip in self.media_overlays:
+            if clip.media_kind == "image":
+                pixmap = QPixmap(clip.path)
+                if pixmap.isNull():
+                    continue
+                item = QGraphicsPixmapItem()
+                item.setZValue(1)
+                item.setVisible(False)
+                self.video_scene.addItem(item)
+                self._overlay_preview_records.append({
+                    "clip": clip,
+                    "item": item,
+                    "pixmap": pixmap,
+                    "player": None,
+                    "audio_output": None,
+                })
+            elif MULTIMEDIA_AVAILABLE:
+                item = QGraphicsVideoItem()
+                item.setAspectRatioMode(Qt.IgnoreAspectRatio)
+                item.setZValue(1)
+                item.setVisible(False)
+                player = QMediaPlayer(self)
+                audio_output = QAudioOutput(self)
+                audio_output.setMuted(True)
+                player.setAudioOutput(audio_output)
+                player.setVideoOutput(item)
+                player.setSource(QUrl.fromLocalFile(clip.path))
+                self.video_scene.addItem(item)
+                self._overlay_preview_records.append({
+                    "clip": clip,
+                    "item": item,
+                    "pixmap": QPixmap(),
+                    "player": player,
+                    "audio_output": audio_output,
+                })
+        self.sync_overlay_preview_geometry()
+        self.sync_overlay_preview_at(self.current_expert_seconds())
+
+    def sync_overlay_preview_geometry(self):
+        if self.video_scene is None:
+            return
+        scene_rect = self.video_scene.sceneRect()
+        width = max(1, int(scene_rect.width()))
+        height = max(1, int(scene_rect.height()))
+        for record in getattr(self, "_overlay_preview_records", []):
+            item = record.get("item")
+            if item is None:
+                continue
+            item.setPos(0, 0)
+            pixmap = record.get("pixmap")
+            if pixmap is not None and not pixmap.isNull() and isinstance(item, QGraphicsPixmapItem):
+                item.setPixmap(pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            elif QGraphicsVideoItem is not None and isinstance(item, QGraphicsVideoItem):
+                item.setSize(scene_rect.size())
+
+    def sync_overlay_preview_at(self, seconds):
+        base_playing = (
+            self.media_player is not None
+            and QMediaPlayer is not None
+            and self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        for record in getattr(self, "_overlay_preview_records", []):
+            clip = record.get("clip")
+            item = record.get("item")
+            if clip is None or item is None:
+                continue
+            visible = clip.start <= seconds < clip.end
+            item.setVisible(visible)
+            player = record.get("player")
+            if player is None:
+                continue
+            if not visible:
+                player.pause()
+                continue
+            target_ms = max(0, int((clip.source_start + seconds - clip.start) * 1000))
+            if abs(player.position() - target_ms) > 150:
+                player.setPosition(target_ms)
+            if base_playing:
+                player.play()
+            else:
+                player.pause()
 
     def add_expert_subtitle(self):
         text = self.subtitle_text_edit.toPlainText()
@@ -2431,6 +3091,9 @@ class MainWindow(QMainWindow):
         self.expert_play_button.setEnabled(preview_enabled)
         self.expert_position_slider.setEnabled(preview_enabled)
         self.timeline_widget.setEnabled(enabled)
+        self.timeline_zoom_slider.setEnabled(enabled)
+        self.timeline_zoom_down_button.setEnabled(enabled)
+        self.timeline_zoom_up_button.setEnabled(enabled)
         self.delete_selection_button.setEnabled(enabled and self.expert_selection.is_range)
         self.delete_frame_button.setEnabled(enabled and self.expert_duration_seconds > 0)
         self.import_subtitle_button.setEnabled(enabled)
@@ -2452,6 +3115,7 @@ class MainWindow(QMainWindow):
         self.update_expert_delete_range_buttons()
         self.update_subtitle_buttons()
         self.update_audio_buttons()
+        self.update_overlay_buttons()
 
     def update_processing_buttons(self):
         busy = self.process_thread is not None or self.transcribe_thread is not None
@@ -2568,6 +3232,7 @@ class MainWindow(QMainWindow):
                 subtitles=self.subtitle_project,
                 source_audio_muted=self.source_audio_muted,
                 audio_tracks=tuple(self.audio_tracks),
+                media_overlays=tuple(self.media_overlays),
             ).validate()
         except (PlanValidationError, SubtitleValidationError) as exc:
             QMessageBox.warning(self, "编辑参数无效", str(exc))
@@ -2734,6 +3399,7 @@ class MainWindow(QMainWindow):
         for thread in list(self.thumbnail_threads):
             thread.stop()
             thread.wait(3000)
+        self.clear_overlay_preview_items()
         if self.media_player is not None:
             self.media_player.stop()
         event.accept()
