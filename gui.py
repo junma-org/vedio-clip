@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsObject,
-    QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
     QGridLayout,
@@ -87,6 +86,7 @@ from ffmpeg_utils import (
     prepare_subtitle_file_for_plan,
     run_ffmpeg_with_progress,
 )
+from preview_controller import OverlayPreviewController
 from subtitle_model import (
     SubtitleCue,
     SubtitleProject,
@@ -696,7 +696,6 @@ class MainWindow(QMainWindow):
         self._selected_overlay_index = -1
         self.audio_track_volume_spins = []
         self.audio_track_remove_buttons = []
-        self._overlay_preview_records = []
         self.available_subtitle_fonts = list(dict.fromkeys(FONT_PRESETS))
         self._subtitle_fonts_loaded = False
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
@@ -704,6 +703,7 @@ class MainWindow(QMainWindow):
         self.media_player = None
         self.audio_output = None
         self.video_scene = None
+        self.overlay_preview_controller = None
         self.video_item = None
         self.subtitle_overlay_item = None
         self.preview_popout_dialog = None
@@ -1042,6 +1042,7 @@ class MainWindow(QMainWindow):
         self.expert_preview_stack.addWidget(self.expert_preview_empty)
 
         self.video_scene = QGraphicsScene(self)
+        self.overlay_preview_controller = OverlayPreviewController(self.video_scene, parent=self)
         self.expert_preview_view = PreviewGraphicsView(self.video_scene, self)
         self.expert_preview_view.setMinimumHeight(220)
         self.expert_preview_container = QWidget()
@@ -2827,13 +2828,12 @@ class MainWindow(QMainWindow):
         self.update_overlay_buttons()
 
     def update_overlay_preview_records(self):
-        records = getattr(self, "_overlay_preview_records", [])
-        if len(records) != len(self.media_overlays):
-            self.refresh_overlay_preview_items()
-            return
-        for record, clip in zip(records, self.media_overlays):
-            record["clip"] = clip
-        self.sync_overlay_preview_at(self.current_expert_seconds())
+        if self.overlay_preview_controller is not None:
+            self.overlay_preview_controller.update_clips(
+                self.media_overlays,
+                current_seconds=self.current_expert_seconds(),
+                base_player=self.media_player,
+            )
 
     def selected_overlay_index(self):
         row = self.overlay_list.currentRow() if hasattr(self, "overlay_list") else -1
@@ -2962,109 +2962,24 @@ class MainWindow(QMainWindow):
         self.update_expert_controls_state()
 
     def clear_overlay_preview_items(self):
-        for record in getattr(self, "_overlay_preview_records", []):
-            player = record.get("player")
-            if player is not None:
-                player.stop()
-                player.deleteLater()
-            audio_output = record.get("audio_output")
-            if audio_output is not None:
-                audio_output.deleteLater()
-            item = record.get("item")
-            if item is not None and self.video_scene is not None:
-                self.video_scene.removeItem(item)
-        self._overlay_preview_records = []
+        if self.overlay_preview_controller is not None:
+            self.overlay_preview_controller.clear()
 
     def refresh_overlay_preview_items(self):
-        if self.video_scene is None:
-            return
-        self.clear_overlay_preview_items()
-        if not self.media_overlays:
-            return
-        for clip in self.media_overlays:
-            if clip.media_kind == "image":
-                pixmap = QPixmap(clip.path)
-                if pixmap.isNull():
-                    continue
-                item = QGraphicsPixmapItem()
-                item.setZValue(1)
-                item.setVisible(False)
-                self.video_scene.addItem(item)
-                self._overlay_preview_records.append({
-                    "clip": clip,
-                    "item": item,
-                    "pixmap": pixmap,
-                    "player": None,
-                    "audio_output": None,
-                })
-            elif MULTIMEDIA_AVAILABLE:
-                item = QGraphicsVideoItem()
-                item.setAspectRatioMode(Qt.IgnoreAspectRatio)
-                item.setZValue(1)
-                item.setVisible(False)
-                player = QMediaPlayer(self)
-                audio_output = QAudioOutput(self)
-                audio_output.setMuted(True)
-                player.setAudioOutput(audio_output)
-                player.setVideoOutput(item)
-                player.setSource(QUrl.fromLocalFile(clip.path))
-                self.video_scene.addItem(item)
-                self._overlay_preview_records.append({
-                    "clip": clip,
-                    "item": item,
-                    "pixmap": QPixmap(),
-                    "player": player,
-                    "audio_output": audio_output,
-                })
-        self.sync_overlay_preview_geometry()
-        self.sync_overlay_preview_at(self.current_expert_seconds())
+        if self.overlay_preview_controller is not None:
+            self.overlay_preview_controller.refresh(
+                self.media_overlays,
+                current_seconds=self.current_expert_seconds(),
+                base_player=self.media_player,
+            )
 
     def sync_overlay_preview_geometry(self):
-        if self.video_scene is None:
-            return
-        scene_rect = self.video_scene.sceneRect()
-        width = max(1, int(scene_rect.width()))
-        height = max(1, int(scene_rect.height()))
-        for record in getattr(self, "_overlay_preview_records", []):
-            item = record.get("item")
-            if item is None:
-                continue
-            item.setPos(0, 0)
-            pixmap = record.get("pixmap")
-            if pixmap is not None and not pixmap.isNull() and isinstance(item, QGraphicsPixmapItem):
-                item.setPixmap(pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
-            elif QGraphicsVideoItem is not None and isinstance(item, QGraphicsVideoItem):
-                item.setSize(scene_rect.size())
+        if self.overlay_preview_controller is not None:
+            self.overlay_preview_controller.sync_geometry()
 
     def sync_overlay_preview_at(self, seconds):
-        base_playing = (
-            self.media_player is not None
-            and QMediaPlayer is not None
-            and self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        )
-        for record in getattr(self, "_overlay_preview_records", []):
-            clip = record.get("clip")
-            item = record.get("item")
-            if clip is None or item is None:
-                continue
-            visible = clip.start <= seconds < clip.end
-            if item.isVisible() != visible:
-                item.setVisible(visible)
-            player = record.get("player")
-            if player is None:
-                continue
-            if not visible:
-                if player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
-                    player.pause()
-                continue
-            target_ms = max(0, int((clip.source_start + seconds - clip.start) * 1000))
-            if abs(player.position() - target_ms) > 150:
-                player.setPosition(target_ms)
-            if base_playing:
-                if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                    player.play()
-            elif player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
-                player.pause()
+        if self.overlay_preview_controller is not None:
+            self.overlay_preview_controller.sync_at(seconds, base_player=self.media_player)
 
     def add_expert_subtitle(self):
         text = self.subtitle_text_edit.toPlainText()
