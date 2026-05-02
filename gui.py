@@ -68,6 +68,7 @@ from PySide6.QtWidgets import (
 )
 
 from edit_model import AudioTrack, DeleteRange, EditPlan, OverlayClip, OutputOptions, PlanValidationError, normalize_delete_ranges
+from editor_session import EditorSession
 from ffmpeg_utils import (
     build_ffmpeg_command_from_plan,
     build_thumbnail_command,
@@ -700,13 +701,14 @@ class MainWindow(QMainWindow):
         self.transcribe_thread = None
         self.thumbnail_threads = []
 
-        self.delete_ranges = []
-        self.expert_delete_ranges = []
-        self.expert_selection = TimelineSelection(0, 0)
         self.expert_duration_seconds = 0.0
         self.expert_fps = 30.0
         self.expert_video_size = (1920, 1080)
         self.expert_native_video_size = (1920, 1080)
+        self.editor_session = EditorSession(subtitle_project=build_default_subtitle_project(self.expert_video_size))
+        self.delete_ranges = []
+        self.expert_delete_ranges = []
+        self.expert_selection = TimelineSelection(0, 0)
         self.expert_output_resolution = None
         self.current_video_has_audio = True
         self.source_audio_muted = False
@@ -737,7 +739,6 @@ class MainWindow(QMainWindow):
         self._syncing_deleted_preview_skip = False
         self._subtitle_timing_dirty = False
         self._subtitle_color = QColor("#ffffff")
-        self._undo_stack = []
         self._restoring_state = False
         self._saved_window_geometry = None
         self._saved_was_maximized = False
@@ -745,6 +746,78 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.init_shortcuts()
+
+    @property
+    def delete_ranges(self):
+        return self.editor_session.delete_ranges
+
+    @delete_ranges.setter
+    def delete_ranges(self, ranges):
+        self.editor_session.delete_ranges = list(ranges or [])
+
+    @property
+    def expert_delete_ranges(self):
+        return self.editor_session.expert_delete_ranges
+
+    @expert_delete_ranges.setter
+    def expert_delete_ranges(self, ranges):
+        self.editor_session.expert_delete_ranges = list(ranges or [])
+
+    @property
+    def expert_selection(self):
+        return self.editor_session.expert_selection
+
+    @expert_selection.setter
+    def expert_selection(self, selection):
+        self.editor_session.expert_selection = selection
+
+    @property
+    def expert_output_resolution(self):
+        return self.editor_session.expert_output_resolution
+
+    @expert_output_resolution.setter
+    def expert_output_resolution(self, resolution):
+        self.editor_session.expert_output_resolution = resolution
+
+    @property
+    def source_audio_muted(self):
+        return self.editor_session.source_audio_muted
+
+    @source_audio_muted.setter
+    def source_audio_muted(self, muted):
+        self.editor_session.source_audio_muted = bool(muted)
+
+    @property
+    def audio_tracks(self):
+        return self.editor_session.audio_tracks
+
+    @audio_tracks.setter
+    def audio_tracks(self, tracks):
+        self.editor_session.audio_tracks = list(tracks or [])
+
+    @property
+    def media_overlays(self):
+        return self.editor_session.media_overlays
+
+    @media_overlays.setter
+    def media_overlays(self, overlays):
+        self.editor_session.media_overlays = list(overlays or [])
+
+    @property
+    def _selected_overlay_index(self):
+        return self.editor_session.selected_overlay_index
+
+    @_selected_overlay_index.setter
+    def _selected_overlay_index(self, index):
+        self.editor_session.selected_overlay_index = int(index)
+
+    @property
+    def subtitle_project(self):
+        return self.editor_session.subtitle_project
+
+    @subtitle_project.setter
+    def subtitle_project(self, project):
+        self.editor_session.subtitle_project = project if project is not None else SubtitleProject()
 
     def init_ui(self):
         central = QWidget()
@@ -1421,51 +1494,32 @@ class MainWindow(QMainWindow):
 
     def snapshot_editor_state(self):
         subtitle_row = self.current_subtitle_row() if hasattr(self, "subtitle_table") else -1
-        return {
-            "delete_ranges": list(self.delete_ranges),
-            "expert_delete_ranges": list(self.expert_delete_ranges),
-            "expert_selection": self.expert_selection,
-            "expert_output_resolution": self.expert_output_resolution,
-            "source_audio_muted": self.source_audio_muted,
-            "audio_tracks": list(self.audio_tracks),
-            "media_overlays": list(self.media_overlays),
-            "selected_overlay_index": self._selected_overlay_index,
-            "subtitle_project": self.subtitle_project,
-            "subtitle_row": subtitle_row,
-        }
+        return self.editor_session.snapshot(subtitle_row=subtitle_row)
 
     def push_undo_state(self):
         if self._restoring_state:
             return
-        self._undo_stack.append(self.snapshot_editor_state())
-        if len(self._undo_stack) > 50:
-            self._undo_stack = self._undo_stack[-50:]
+        self.editor_session.push_undo_state(self.snapshot_editor_state())
         self.update_undo_action_state()
 
     def clear_undo_stack(self):
-        self._undo_stack = []
+        self.editor_session.clear_undo_stack()
         self.update_undo_action_state()
 
     def update_undo_action_state(self):
         if hasattr(self, "undo_action"):
-            self.undo_action.setEnabled(bool(self._undo_stack) and self.process_thread is None and self.transcribe_thread is None)
+            self.undo_action.setEnabled(
+                self.editor_session.has_undo() and self.process_thread is None and self.transcribe_thread is None
+            )
 
     def undo_last_operation(self):
-        if self.process_thread is not None or self.transcribe_thread is not None or not self._undo_stack:
+        if self.process_thread is not None or self.transcribe_thread is not None or not self.editor_session.has_undo():
             return
 
-        state = self._undo_stack.pop()
+        state = self.editor_session.pop_undo_state()
         self._restoring_state = True
         try:
-            self.delete_ranges = list(state["delete_ranges"])
-            self.expert_delete_ranges = list(state["expert_delete_ranges"])
-            self.expert_selection = state["expert_selection"]
-            self.expert_output_resolution = state["expert_output_resolution"]
-            self.source_audio_muted = bool(state.get("source_audio_muted", False))
-            self.audio_tracks = list(state.get("audio_tracks", []))
-            self.media_overlays = list(state.get("media_overlays", []))
-            self._selected_overlay_index = int(state.get("selected_overlay_index", -1))
-            self.subtitle_project = state["subtitle_project"].normalized()
+            self.editor_session.restore(state)
             self._subtitle_timing_dirty = False
 
             self.refresh_delete_ranges_list()
@@ -1485,7 +1539,7 @@ class MainWindow(QMainWindow):
             self._syncing_resolution_controls = False
             self.apply_expert_preview_resolution()
 
-            subtitle_row = state.get("subtitle_row", -1)
+            subtitle_row = state.subtitle_row
             if 0 <= subtitle_row < len(self.subtitle_project.cues):
                 self.subtitle_table.selectRow(subtitle_row)
                 self.on_subtitle_selection_changed()
@@ -3141,11 +3195,7 @@ class MainWindow(QMainWindow):
 
     def build_transcription_plan_from_controls(self):
         try:
-            return EditPlan(
-                source_audio_muted=self.source_audio_muted,
-                audio_tracks=tuple(self.audio_tracks),
-                has_audio=self.current_video_has_audio,
-            ).validate()
+            return self.editor_session.to_transcription_plan(has_audio=self.current_video_has_audio).validate()
         except PlanValidationError as exc:
             QMessageBox.warning(self, "识别参数无效", str(exc))
             return None
@@ -3352,14 +3402,7 @@ class MainWindow(QMainWindow):
 
     def build_expert_edit_plan_from_controls(self):
         try:
-            return EditPlan(
-                delete_ranges=tuple(DeleteRange(start, end) for start, end in self.expert_delete_ranges),
-                output=OutputOptions(resolution=self.expert_output_resolution),
-                subtitles=self.subtitle_project,
-                source_audio_muted=self.source_audio_muted,
-                audio_tracks=tuple(self.audio_tracks),
-                media_overlays=tuple(self.media_overlays),
-            ).validate()
+            return self.editor_session.to_edit_plan().validate()
         except (PlanValidationError, SubtitleValidationError) as exc:
             QMessageBox.warning(self, "编辑参数无效", str(exc))
             return None
