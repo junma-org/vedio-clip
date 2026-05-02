@@ -15,6 +15,14 @@ from timeline_state import (
     resize_timed_range,
     selection_from_points,
 )
+from timeline_tracks import (
+    TIMELINE_TRACKS,
+    TRACK_OVERLAY,
+    TRACK_SUBTITLE,
+    TRACK_VIDEO,
+    clip_visible_range,
+    track_rect_tuple,
+)
 
 
 class TimelineWidget(QWidget):
@@ -158,17 +166,22 @@ class TimelineWidget(QWidget):
     def _content_rect(self):
         return self.rect().adjusted(14, 12, -14, -12)
 
-    def _video_track_rect(self):
+    def _track_rect(self, track_key):
         rect = self._content_rect()
-        return QRectF(rect.left(), rect.top() + 42, rect.width(), 44)
+        left, top, width, height = track_rect_tuple(
+            (rect.left(), rect.top(), rect.width(), rect.height()),
+            track_key,
+        )
+        return QRectF(left, top, width, height)
+
+    def _video_track_rect(self):
+        return self._track_rect(TRACK_VIDEO)
 
     def _overlay_track_rect(self):
-        rect = self._content_rect()
-        return QRectF(rect.left(), rect.top(), rect.width(), 28)
+        return self._track_rect(TRACK_OVERLAY)
 
     def _subtitle_track_rect(self):
-        rect = self._content_rect()
-        return QRectF(rect.left(), rect.top() + 102, rect.width(), 34)
+        return self._track_rect(TRACK_SUBTITLE)
 
     def _time_to_x(self, seconds):
         rect = self._content_rect()
@@ -202,41 +215,21 @@ class TimelineWidget(QWidget):
         return self._overlay_clips[index]
 
     def _visible_block_rect(self, start, end, track_rect, min_width=8):
-        visible_start = self._view_start
-        visible_end = self._visible_end()
-        if end < visible_start or start > visible_end:
+        visible_range = clip_visible_range(start, end, self._view_start, self._visible_end())
+        if visible_range is None:
             return None
-        start_x = self._time_to_x(max(start, visible_start))
-        end_x = self._time_to_x(min(end, visible_end))
+        visible_start, visible_end = visible_range
+        start_x = self._time_to_x(visible_start)
+        end_x = self._time_to_x(visible_end)
         return QRectF(start_x, track_rect.top(), max(min_width, end_x - start_x), track_rect.height())
 
-    def _overlay_hit_at(self, pos):
-        overlay_rect = self._overlay_track_rect()
-        if not overlay_rect.contains(pos):
+    def _timed_block_hit_at(self, pos, track_rect, indices, item_times, min_width=8):
+        if not track_rect.contains(pos):
             return -1, None
 
-        for index in reversed(range(len(self._overlay_clips))):
-            clip = self._overlay_clip(index)
-            block = self._visible_block_rect(clip.start, clip.end, overlay_rect, min_width=10)
-            if block is None or not block.contains(pos):
-                continue
-            start_x = self._time_to_x(clip.start)
-            end_x = self._time_to_x(clip.end)
-            if abs(pos.x() - start_x) <= self._handle_radius:
-                return index, "start"
-            if abs(pos.x() - end_x) <= self._handle_radius:
-                return index, "end"
-            return index, None
-        return -1, None
-
-    def _subtitle_hit_at(self, pos):
-        subtitle_rect = self._subtitle_track_rect()
-        if not subtitle_rect.contains(pos):
-            return -1, None
-
-        for index, cue in enumerate(self._subtitle_cues):
-            start, end = self._subtitle_times(index, cue)
-            block = self._visible_block_rect(start, end, subtitle_rect, min_width=8)
+        for index in indices:
+            start, end = item_times(index)
+            block = self._visible_block_rect(start, end, track_rect, min_width=min_width)
             if block is None or not block.contains(pos):
                 continue
             start_x = self._time_to_x(start)
@@ -247,6 +240,36 @@ class TimelineWidget(QWidget):
                 return index, "end"
             return index, None
         return -1, None
+
+    def _overlay_hit_at(self, pos):
+        overlay_rect = self._overlay_track_rect()
+
+        def item_times(index):
+            clip = self._overlay_clip(index)
+            return clip.start, clip.end
+
+        return self._timed_block_hit_at(
+            pos,
+            overlay_rect,
+            reversed(range(len(self._overlay_clips))),
+            item_times,
+            min_width=10,
+        )
+
+    def _subtitle_hit_at(self, pos):
+        subtitle_rect = self._subtitle_track_rect()
+
+        def item_times(index):
+            cue = self._subtitle_cues[index]
+            return self._subtitle_times(index, cue)
+
+        return self._timed_block_hit_at(
+            pos,
+            subtitle_rect,
+            range(len(self._subtitle_cues)),
+            item_times,
+            min_width=8,
+        )
 
     def _subtitle_index_at(self, pos):
         index, _edge = self._subtitle_hit_at(pos)
@@ -534,14 +557,7 @@ class TimelineWidget(QWidget):
         video_rect = self._video_track_rect()
         subtitle_rect = self._subtitle_track_rect()
 
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#dbe7f2"))
-        painter.drawRoundedRect(overlay_rect, 7, 7)
-        painter.setBrush(QColor("#dce6f2"))
-        painter.drawRoundedRect(video_rect, 8, 8)
-        painter.setBrush(QColor("#e9eef5"))
-        painter.drawRoundedRect(subtitle_rect, 8, 8)
-
+        self._paint_track_backgrounds(painter)
         self._paint_ticks(painter, content)
         self._paint_overlay_blocks(painter, overlay_rect)
         self._paint_delete_ranges(painter, video_rect)
@@ -549,11 +565,22 @@ class TimelineWidget(QWidget):
         self._paint_selection(painter, content)
         self._paint_playhead(painter, content)
 
+        self._paint_track_labels(painter)
+
+    def _paint_track_backgrounds(self, painter):
+        painter.setPen(Qt.NoPen)
+        for track in TIMELINE_TRACKS:
+            painter.setBrush(QColor(track.background))
+            painter.drawRoundedRect(self._track_rect(track.key), track.radius, track.radius)
+
+    def _paint_track_labels(self, painter):
         painter.setPen(QColor("#526277"))
-        painter.drawText(overlay_rect.adjusted(10, 0, -10, 0), Qt.AlignLeft | Qt.AlignVCenter, "叠加轨")
-        painter.setPen(QColor("#526277"))
-        painter.drawText(video_rect.adjusted(10, 0, -10, 0), Qt.AlignLeft | Qt.AlignVCenter, "视频轨")
-        painter.drawText(subtitle_rect.adjusted(10, 0, -10, 0), Qt.AlignLeft | Qt.AlignVCenter, "字幕轨")
+        for track in TIMELINE_TRACKS:
+            painter.drawText(
+                self._track_rect(track.key).adjusted(10, 0, -10, 0),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                track.label,
+            )
 
     def _paint_ticks(self, painter, rect):
         if self._duration <= 0:
