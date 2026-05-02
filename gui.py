@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -54,7 +55,9 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollBar,
     QSlider,
+    QSplitter,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -542,7 +545,7 @@ class PreviewGraphicsView(QGraphicsView):
         self.setAlignment(Qt.AlignCenter)
         self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
 
     def sync_scene_view(self):
         if self.scene() is None or self.scene().sceneRect().isNull():
@@ -713,7 +716,8 @@ class MainWindow(QMainWindow):
         self.audio_track_volume_spins = []
         self.audio_track_remove_buttons = []
         self._overlay_preview_records = []
-        self.available_subtitle_fonts = subtitle_font_options()
+        self.available_subtitle_fonts = list(dict.fromkeys(FONT_PRESETS))
+        self._subtitle_fonts_loaded = False
         self.subtitle_project = build_default_subtitle_project(self.expert_video_size)
 
         self.media_player = None
@@ -721,6 +725,8 @@ class MainWindow(QMainWindow):
         self.video_scene = None
         self.video_item = None
         self.subtitle_overlay_item = None
+        self.preview_popout_dialog = None
+        self.preview_popout_view = None
         self._syncing_expert_position = False
         self._syncing_style_controls = False
         self._syncing_subtitle_editor = False
@@ -739,7 +745,6 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.init_shortcuts()
-        self.check_ffmpeg()
 
     def init_ui(self):
         central = QWidget()
@@ -797,6 +802,31 @@ class MainWindow(QMainWindow):
         self.undo_action.triggered.connect(self.undo_last_operation)
         self.addAction(self.undo_action)
         self.update_undo_action_state()
+
+    def ensure_subtitle_fonts_loaded(self):
+        if self._subtitle_fonts_loaded:
+            return
+        self._subtitle_fonts_loaded = True
+        current_text = self.subtitle_font_combo.currentText() if hasattr(self, "subtitle_font_combo") else ""
+        options = subtitle_font_options()
+        if not options:
+            options = self.available_subtitle_fonts
+        self.available_subtitle_fonts = list(dict.fromkeys(options))
+        if not hasattr(self, "subtitle_font_combo"):
+            return
+        self._syncing_style_controls = True
+        try:
+            self.subtitle_font_combo.clear()
+            for family in self.available_subtitle_fonts:
+                self.subtitle_font_combo.addItem(family)
+            if current_text:
+                index = self.subtitle_font_combo.findText(current_text)
+                if index >= 0:
+                    self.subtitle_font_combo.setCurrentIndex(index)
+                else:
+                    self.subtitle_font_combo.setEditText(current_text)
+        finally:
+            self._syncing_style_controls = False
 
     def create_simple_page(self):
         page = QWidget()
@@ -925,14 +955,35 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(12)
         layout.addLayout(content_layout, 1)
 
-        left_panel = QVBoxLayout()
+        left_container = QWidget()
+        left_panel = QVBoxLayout(left_container)
+        left_panel.setContentsMargins(0, 0, 0, 0)
         left_panel.setSpacing(10)
-        content_layout.addLayout(left_panel, 3)
+        content_layout.addWidget(left_container, 3)
+
+        self.expert_main_splitter = QSplitter(Qt.Vertical)
+        self.expert_main_splitter.setChildrenCollapsible(False)
+        left_panel.addWidget(self.expert_main_splitter, 1)
+
+        preview_panel = QWidget()
+        preview_panel_layout = QVBoxLayout(preview_panel)
+        preview_panel_layout.setContentsMargins(0, 0, 0, 0)
+        preview_panel_layout.setSpacing(8)
+        self.expert_main_splitter.addWidget(preview_panel)
+
+        timeline_panel = QWidget()
+        timeline_panel_layout = QVBoxLayout(timeline_panel)
+        timeline_panel_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_panel_layout.setSpacing(8)
+        self.expert_main_splitter.addWidget(timeline_panel)
+        self.expert_main_splitter.setStretchFactor(0, 3)
+        self.expert_main_splitter.setStretchFactor(1, 2)
+        self.expert_main_splitter.setSizes([520, 320])
 
         self.expert_preview_stack = QStackedWidget()
         self.expert_preview_empty = QLabel("打开视频后开始编辑")
         self.expert_preview_empty.setAlignment(Qt.AlignCenter)
-        self.expert_preview_empty.setMinimumHeight(360)
+        self.expert_preview_empty.setMinimumHeight(220)
         self.expert_preview_empty.setStyleSheet(
             "background: #eef3f9; border: 1px solid #d7e1ed; border-radius: 12px; color: #5c6b7d; font-size: 16px;"
         )
@@ -940,7 +991,7 @@ class MainWindow(QMainWindow):
 
         self.video_scene = QGraphicsScene(self)
         self.expert_preview_view = PreviewGraphicsView(self.video_scene, self)
-        self.expert_preview_view.setMinimumHeight(360)
+        self.expert_preview_view.setMinimumHeight(220)
         self.expert_preview_container = QWidget()
         preview_container_layout = QGridLayout(self.expert_preview_container)
         preview_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -964,12 +1015,16 @@ class MainWindow(QMainWindow):
         resolution_overlay_layout.addWidget(self.expert_res_combo)
         preview_container_layout.addWidget(resolution_overlay, 0, 0, Qt.AlignRight | Qt.AlignBottom)
         self.expert_preview_stack.addWidget(self.expert_preview_container)
-        left_panel.addWidget(self.expert_preview_stack)
+        preview_panel_layout.addWidget(self.expert_preview_stack, 1)
 
         transport_layout = QHBoxLayout()
         self.expert_play_button = QPushButton("播放")
         self.expert_play_button.clicked.connect(self.toggle_expert_playback)
         transport_layout.addWidget(self.expert_play_button)
+
+        self.popout_preview_button = QPushButton("弹出预览")
+        self.popout_preview_button.clicked.connect(self.open_preview_popout)
+        transport_layout.addWidget(self.popout_preview_button)
 
         self.expert_current_label = QLabel("0:00")
         transport_layout.addWidget(self.expert_current_label)
@@ -981,7 +1036,7 @@ class MainWindow(QMainWindow):
 
         self.expert_duration_label = QLabel("0:00")
         transport_layout.addWidget(self.expert_duration_label)
-        left_panel.addLayout(transport_layout)
+        preview_panel_layout.addLayout(transport_layout)
 
         self.timeline_widget = TimelineWidget()
         self.timeline_widget.playheadChanged.connect(self.seek_expert_seconds)
@@ -991,6 +1046,10 @@ class MainWindow(QMainWindow):
         self.timeline_widget.overlayActivated.connect(self.select_overlay_row)
         self.timeline_widget.overlayTimingPreviewed.connect(self.on_overlay_timing_previewed)
         self.timeline_widget.overlayTimingChanged.connect(self.on_overlay_timing_changed)
+        self.timeline_widget.viewStartChanged.connect(self.on_timeline_view_start_changed)
+        self.timeline_widget.zoomStepRequested.connect(
+            lambda step: self.set_timeline_zoom_value(self.timeline_zoom_slider.value() + step)
+        )
 
         timeline_tools_layout = QHBoxLayout()
         timeline_tools_layout.addWidget(QLabel("时间线"))
@@ -1007,12 +1066,15 @@ class MainWindow(QMainWindow):
         timeline_tools_layout.addWidget(self.timeline_zoom_up_button)
         self.timeline_zoom_label = QLabel("1.0x")
         timeline_tools_layout.addWidget(self.timeline_zoom_label)
-        self.timeline_scroll_slider = QSlider(Qt.Horizontal)
-        self.timeline_scroll_slider.setRange(0, 0)
-        self.timeline_scroll_slider.valueChanged.connect(self.on_timeline_scroll_changed)
-        timeline_tools_layout.addWidget(self.timeline_scroll_slider, 2)
-        left_panel.addLayout(timeline_tools_layout)
-        left_panel.addWidget(self.timeline_widget)
+        timeline_tools_layout.addStretch()
+        timeline_panel_layout.addLayout(timeline_tools_layout)
+        timeline_panel_layout.addWidget(self.timeline_widget)
+
+        self.timeline_scroll_bar = QScrollBar(Qt.Horizontal)
+        self.timeline_scroll_bar.setRange(0, 0)
+        self.timeline_scroll_bar.setVisible(False)
+        self.timeline_scroll_bar.valueChanged.connect(self.on_timeline_scroll_changed)
+        timeline_panel_layout.addWidget(self.timeline_scroll_bar)
 
         delete_actions_layout = QHBoxLayout()
         self.delete_selection_button = QPushButton("删除选区")
@@ -1031,12 +1093,12 @@ class MainWindow(QMainWindow):
         self.clear_expert_ranges_button.clicked.connect(self.clear_expert_delete_ranges)
         delete_actions_layout.addWidget(self.clear_expert_ranges_button)
         delete_actions_layout.addStretch()
-        left_panel.addLayout(delete_actions_layout)
+        timeline_panel_layout.addLayout(delete_actions_layout)
 
         self.expert_delete_ranges_list = QListWidget()
         self.expert_delete_ranges_list.setMaximumHeight(86)
         self.expert_delete_ranges_list.itemSelectionChanged.connect(self.update_expert_delete_range_buttons)
-        left_panel.addWidget(self.expert_delete_ranges_list)
+        timeline_panel_layout.addWidget(self.expert_delete_ranges_list)
 
         right_panel = QFrame()
         right_panel.setObjectName("subtitleSidePanel")
@@ -1306,6 +1368,7 @@ class MainWindow(QMainWindow):
         self.update_expert_controls_state()
 
     def enter_expert_mode(self):
+        self.ensure_subtitle_fonts_loaded()
         if not self.isMaximized():
             self._saved_window_geometry = self.geometry()
             self._saved_was_maximized = False
@@ -1649,8 +1712,39 @@ class MainWindow(QMainWindow):
         self.video_item.update()
 
     def sync_expert_preview_view(self):
-        if hasattr(self, "expert_preview_view"):
-            self.expert_preview_view.sync_scene_view()
+        for view in (getattr(self, "expert_preview_view", None), self.preview_popout_view):
+            if view is not None:
+                view.sync_scene_view()
+
+    def open_preview_popout(self):
+        if self.video_scene is None or self.media_player is None:
+            return
+        if self.preview_popout_dialog is not None:
+            self.preview_popout_dialog.raise_()
+            self.preview_popout_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("达人模式预览")
+        dialog.setMinimumSize(720, 480)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(0)
+
+        view = PreviewGraphicsView(self.video_scene, dialog)
+        layout.addWidget(view)
+        dialog.finished.connect(self.on_preview_popout_closed)
+        self.preview_popout_dialog = dialog
+        self.preview_popout_view = view
+        view.sync_scene_view()
+        dialog.show()
+
+    def on_preview_popout_closed(self, *_args):
+        dialog = self.preview_popout_dialog
+        self.preview_popout_dialog = None
+        self.preview_popout_view = None
+        if dialog is not None:
+            dialog.deleteLater()
 
     def apply_expert_preview_resolution(self):
         if self.video_scene is None:
@@ -1793,19 +1887,27 @@ class MainWindow(QMainWindow):
     def on_timeline_scroll_changed(self, value):
         if self._syncing_timeline_controls:
             return
-        max_start = max(0.0, self.expert_duration_seconds - self.timeline_widget.visible_duration())
-        self.timeline_widget.set_view_start((float(value) / 1000.0) * max_start if max_start > 0 else 0)
+        self.timeline_widget.set_view_start(float(value) / 1000.0)
+
+    def on_timeline_view_start_changed(self, _seconds):
+        self.refresh_timeline_scroll_controls()
 
     def refresh_timeline_scroll_controls(self):
-        if not hasattr(self, "timeline_scroll_slider"):
+        if not hasattr(self, "timeline_scroll_bar"):
             return
         max_start = max(0.0, self.expert_duration_seconds - self.timeline_widget.visible_duration())
         self._syncing_timeline_controls = True
         try:
-            self.timeline_scroll_slider.setEnabled(max_start > 0)
-            self.timeline_scroll_slider.setRange(0, 1000 if max_start > 0 else 0)
-            value = 0 if max_start <= 0 else int((self.timeline_widget.view_start / max_start) * 1000)
-            self.timeline_scroll_slider.setValue(max(0, min(1000, value)))
+            max_value = max(0, int(round(max_start * 1000)))
+            page_step = max(1, int(round(self.timeline_widget.visible_duration() * 1000)))
+            single_step = max(1, int(round(self.timeline_widget.visible_duration() * 100)))
+            self.timeline_scroll_bar.setVisible(max_start > 0)
+            self.timeline_scroll_bar.setEnabled(max_start > 0)
+            self.timeline_scroll_bar.setRange(0, max_value)
+            self.timeline_scroll_bar.setPageStep(page_step)
+            self.timeline_scroll_bar.setSingleStep(single_step)
+            value = max(0, min(max_value, int(round(self.timeline_widget.view_start * 1000))))
+            self.timeline_scroll_bar.setValue(value)
             self.timeline_zoom_label.setText(f"{self.timeline_widget.zoom:.1f}x")
         finally:
             self._syncing_timeline_controls = False
@@ -2664,7 +2766,7 @@ class MainWindow(QMainWindow):
         media_label = "图片" if clip.media_kind == "image" else "视频"
         return f"{index + 1}. {media_label} {Path(clip.path).name}  {format_time(clip.start)} - {format_time(clip.end)}"
 
-    def refresh_overlay_list(self):
+    def refresh_overlay_list(self, rebuild_preview=True):
         if not hasattr(self, "overlay_list"):
             return
         selected = self._selected_overlay_index
@@ -2682,8 +2784,20 @@ class MainWindow(QMainWindow):
             self._syncing_overlay_controls = False
         self.timeline_widget.set_overlay_clips(self.media_overlays)
         self.timeline_widget.set_selected_overlay_index(self._selected_overlay_index)
-        self.refresh_overlay_preview_items()
+        if rebuild_preview:
+            self.refresh_overlay_preview_items()
+        else:
+            self.update_overlay_preview_records()
         self.update_overlay_buttons()
+
+    def update_overlay_preview_records(self):
+        records = getattr(self, "_overlay_preview_records", [])
+        if len(records) != len(self.media_overlays):
+            self.refresh_overlay_preview_items()
+            return
+        for record, clip in zip(records, self.media_overlays):
+            record["clip"] = clip
+        self.sync_overlay_preview_at(self.current_expert_seconds())
 
     def selected_overlay_index(self):
         row = self.overlay_list.currentRow() if hasattr(self, "overlay_list") else -1
@@ -2768,7 +2882,7 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         self.media_overlays[index] = clip
         self._selected_overlay_index = index
-        self.refresh_overlay_list()
+        self.refresh_overlay_list(rebuild_preview=False)
         self.select_overlay_row(index)
         self.status_label.setText("已更新覆盖素材时间")
 
@@ -2776,9 +2890,16 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.media_overlays):
             return
         self._selected_overlay_index = row
-        self.overlay_start_spin.setValue(clip.start)
-        self.overlay_end_spin.setValue(clip.end)
-        self.status_label.setText("正在调整覆盖素材时间")
+        self._syncing_overlay_controls = True
+        try:
+            if abs(self.overlay_start_spin.value() - clip.start) >= 0.005:
+                self.overlay_start_spin.setValue(clip.start)
+            if abs(self.overlay_end_spin.value() - clip.end) >= 0.005:
+                self.overlay_end_spin.setValue(clip.end)
+        finally:
+            self._syncing_overlay_controls = False
+        if self.status_label.text() != "正在调整覆盖素材时间":
+            self.status_label.setText("正在调整覆盖素材时间")
 
     def on_overlay_timing_changed(self, row, clip, playhead):
         if row < 0 or row >= len(self.media_overlays):
@@ -2786,7 +2907,7 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         self.media_overlays[row] = clip.validate()
         self._selected_overlay_index = row
-        self.refresh_overlay_list()
+        self.refresh_overlay_list(rebuild_preview=False)
         self.select_overlay_row(row)
         self.seek_expert_seconds(playhead)
         self.status_label.setText("已更新覆盖素材时间")
@@ -2891,19 +3012,22 @@ class MainWindow(QMainWindow):
             if clip is None or item is None:
                 continue
             visible = clip.start <= seconds < clip.end
-            item.setVisible(visible)
+            if item.isVisible() != visible:
+                item.setVisible(visible)
             player = record.get("player")
             if player is None:
                 continue
             if not visible:
-                player.pause()
+                if player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
+                    player.pause()
                 continue
             target_ms = max(0, int((clip.source_start + seconds - clip.start) * 1000))
             if abs(player.position() - target_ms) > 150:
                 player.setPosition(target_ms)
             if base_playing:
-                player.play()
-            else:
+                if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    player.play()
+            elif player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
                 player.pause()
 
     def add_expert_subtitle(self):
@@ -3089,11 +3213,13 @@ class MainWindow(QMainWindow):
 
         self.expert_open_file_button.setEnabled(self.process_thread is None and self.transcribe_thread is None)
         self.expert_play_button.setEnabled(preview_enabled)
+        self.popout_preview_button.setEnabled(preview_enabled)
         self.expert_position_slider.setEnabled(preview_enabled)
         self.timeline_widget.setEnabled(enabled)
         self.timeline_zoom_slider.setEnabled(enabled)
         self.timeline_zoom_down_button.setEnabled(enabled)
         self.timeline_zoom_up_button.setEnabled(enabled)
+        self.timeline_scroll_bar.setEnabled(enabled and self.timeline_scroll_bar.maximum() > 0)
         self.delete_selection_button.setEnabled(enabled and self.expert_selection.is_range)
         self.delete_frame_button.setEnabled(enabled and self.expert_duration_seconds > 0)
         self.import_subtitle_button.setEnabled(enabled)
@@ -3399,6 +3525,8 @@ class MainWindow(QMainWindow):
         for thread in list(self.thumbnail_threads):
             thread.stop()
             thread.wait(3000)
+        if self.preview_popout_dialog is not None:
+            self.preview_popout_dialog.close()
         self.clear_overlay_preview_items()
         if self.media_player is not None:
             self.media_player.stop()
@@ -3413,4 +3541,6 @@ class VideoClipperApp:
 
     def run(self):
         self.window.show()
+        self.window.status_label.setText("正在检测 FFmpeg...")
+        QTimer.singleShot(0, self.window.check_ffmpeg)
         return self.app.exec()

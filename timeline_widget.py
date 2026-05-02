@@ -25,6 +25,8 @@ class TimelineWidget(QWidget):
     overlayActivated = Signal(int)
     overlayTimingPreviewed = Signal(int, object, float)
     overlayTimingChanged = Signal(int, object, float)
+    viewStartChanged = Signal(float)
+    zoomStepRequested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -111,8 +113,16 @@ class TimelineWidget(QWidget):
             return
         visible = self.visible_duration()
         seconds = max(0.0, min(float(seconds or 0.0), self._duration))
-        if center or seconds < self._view_start or seconds > self._visible_end():
+        if center:
             self._view_start = seconds - visible / 2
+            self._clamp_view_start()
+            return
+        margin = visible * 0.08
+        if seconds < self._view_start:
+            self._view_start = seconds - margin
+            self._clamp_view_start()
+        elif seconds > self._visible_end():
+            self._view_start = seconds - visible + margin
             self._clamp_view_start()
 
     @property
@@ -402,7 +412,6 @@ class TimelineWidget(QWidget):
         self._overlay_timing_preview = (self._drag_overlay_index, clip)
         self._preview_playhead(playhead)
         self.overlayTimingPreviewed.emit(self._drag_overlay_index, clip, playhead)
-        self.playheadChanged.emit(playhead)
         self.update()
 
     def _preview_subtitle_timing(self, seconds):
@@ -487,6 +496,34 @@ class TimelineWidget(QWidget):
         self.setCursor(QCursor(Qt.ArrowCursor))
         super().leaveEvent(event)
 
+    def wheelEvent(self, event):
+        if self._duration <= 0:
+            super().wheelEvent(event)
+            return
+
+        angle_delta = event.angleDelta()
+        raw_delta = angle_delta.x() if angle_delta.x() else angle_delta.y()
+        if raw_delta == 0:
+            super().wheelEvent(event)
+            return
+
+        if event.modifiers() & Qt.ControlModifier:
+            self.zoomStepRequested.emit(5 if raw_delta > 0 else -5)
+            event.accept()
+            return
+
+        if self._zoom <= 1.0:
+            super().wheelEvent(event)
+            return
+
+        step_seconds = self.visible_duration() * 0.12
+        direction = -1 if raw_delta > 0 else 1
+        before = self._view_start
+        self.set_view_start(self._view_start + direction * step_seconds)
+        if abs(self._view_start - before) > 0.0001:
+            self.viewStartChanged.emit(self._view_start)
+        event.accept()
+
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -563,17 +600,25 @@ class TimelineWidget(QWidget):
         selection = self._selection
         if selection is None:
             return
-        start_x = self._time_to_x(selection.start)
-        end_x = self._time_to_x(selection.end)
         if selection.is_range:
+            visible_start = max(selection.start, self._view_start)
+            visible_end = min(selection.end, self._visible_end())
+            if visible_end <= visible_start:
+                return
+            start_x = self._time_to_x(visible_start)
+            end_x = self._time_to_x(visible_end)
             painter.setPen(QPen(QColor("#1a5fd0"), 2))
             painter.setBrush(QColor(45, 127, 249, 60))
             painter.drawRoundedRect(QRectF(start_x, rect.top(), end_x - start_x, rect.height()), 8, 8)
             painter.setBrush(QColor("#1a5fd0"))
-            painter.drawEllipse(QRectF(start_x - 4, rect.center().y() - 4, 8, 8))
-            painter.drawEllipse(QRectF(end_x - 4, rect.center().y() - 4, 8, 8))
+            if selection.start >= self._view_start:
+                painter.drawEllipse(QRectF(start_x - 4, rect.center().y() - 4, 8, 8))
+            if selection.end <= self._visible_end():
+                painter.drawEllipse(QRectF(end_x - 4, rect.center().y() - 4, 8, 8))
 
     def _paint_playhead(self, painter, rect):
         x_pos = self._time_to_x(self._playhead)
+        if x_pos < rect.left() - 2 or x_pos > rect.right() + 2:
+            return
         painter.setPen(QPen(QColor("#111827"), 2))
         painter.drawLine(x_pos, rect.top() - 4, x_pos, rect.bottom() + 4)
