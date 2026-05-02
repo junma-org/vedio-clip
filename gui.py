@@ -67,6 +67,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from asset_validation import (
+    AssetValidationError,
+    validate_audio_file,
+    validate_image_file,
+    validate_video_file,
+)
 from edit_model import AudioTrack, DeleteRange, EditPlan, OverlayClip, OutputOptions, PlanValidationError, normalize_delete_ranges
 from editor_session import EditorSession
 from ffmpeg_utils import (
@@ -106,33 +112,6 @@ from timeline_state import (
 from timeline_widget import TimelineWidget
 from whisper_utils import WhisperError, transcribe_video_to_project
 
-
-SUPPORTED_VIDEO_EXTENSIONS = {
-    ".mp4",
-    ".avi",
-    ".mkv",
-    ".mov",
-    ".flv",
-    ".wmv",
-    ".webm",
-    ".m4v",
-}
-SUPPORTED_AUDIO_EXTENSIONS = {
-    ".aac",
-    ".flac",
-    ".m4a",
-    ".mp3",
-    ".ogg",
-    ".wav",
-    ".wma",
-}
-SUPPORTED_IMAGE_EXTENSIONS = {
-    ".bmp",
-    ".jpeg",
-    ".jpg",
-    ".png",
-    ".webp",
-}
 
 STYLE_PRESET_LABELS = {
     "short_speech_bottom": "短视频口播",
@@ -1486,6 +1465,9 @@ class MainWindow(QMainWindow):
     def confirm_clear(self, title, message):
         return QMessageBox.question(self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
+    def show_asset_validation_error(self, error):
+        QMessageBox.warning(self, error.title, error.message)
+
     def _combo_index_for_data(self, combo, data):
         for index in range(combo.count()):
             if combo.itemData(index) == data:
@@ -1564,13 +1546,12 @@ class MainWindow(QMainWindow):
             self.on_file_dropped(file_path)
 
     def on_file_dropped(self, file_path):
-        path = Path(file_path)
-        if not path.exists() or not path.is_file():
-            QMessageBox.warning(self, "文件无效", "选择的文件不存在，或不是普通文件。")
+        try:
+            asset = validate_video_file(file_path)
+        except AssetValidationError as exc:
+            self.show_asset_validation_error(exc)
             return
-        if path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
-            QMessageBox.warning(self, "格式不支持", "请选择常见视频文件，例如 MP4、AVI、MKV、MOV。")
-            return
+        path = asset.path
 
         self.current_file = path
         self._expert_media_path = None
@@ -2701,13 +2682,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        path = Path(file_path)
-        if not path.exists() or not path.is_file():
-            QMessageBox.warning(self, "文件无效", "选择的音频文件不存在。")
+        try:
+            asset = validate_audio_file(file_path)
+        except AssetValidationError as exc:
+            self.show_asset_validation_error(exc)
             return
-        if path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
-            QMessageBox.warning(self, "格式不支持", "请选择常见音频文件，例如 MP3、WAV、M4A。")
-            return
+        path = asset.path
 
         self.push_undo_state()
         self.audio_tracks.append(AudioTrack(str(path), 1.0))
@@ -2762,13 +2742,12 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
-        path = Path(file_path)
-        if not path.exists() or not path.is_file():
-            QMessageBox.warning(self, "文件无效", "选择的图片文件不存在。")
+        try:
+            asset = validate_image_file(file_path)
+        except AssetValidationError as exc:
+            self.show_asset_validation_error(exc)
             return
-        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
-            QMessageBox.warning(self, "格式不支持", "请选择常见图片文件，例如 PNG、JPG、WEBP。")
-            return
+        path = asset.path
         start, end = self.overlay_range_from_selection(3.0)
         clip = OverlayClip(str(path), "image", start, end).validate()
         self.push_undo_state()
@@ -2791,13 +2770,16 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
-        path = Path(file_path)
-        if not path.exists() or not path.is_file():
-            QMessageBox.warning(self, "文件无效", "选择的视频文件不存在。")
+        try:
+            asset = validate_video_file(
+                file_path,
+                missing_message="选择的视频文件不存在。",
+                unsupported_message="请选择常见视频文件，例如 MP4、MOV、MKV。",
+            )
+        except AssetValidationError as exc:
+            self.show_asset_validation_error(exc)
             return
-        if path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
-            QMessageBox.warning(self, "格式不支持", "请选择常见视频文件，例如 MP4、MOV、MKV。")
-            return
+        path = asset.path
 
         source_duration = 3.0
         if self.ffmpeg_path is not None:
